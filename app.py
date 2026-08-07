@@ -496,6 +496,48 @@ def touch_results_snapshot(workshop_id):
             {"wid": workshop_id, "updated": now_iso()},
         )
 
+
+def set_active_workshop(workshop_id):
+    """Make exactly one workshop active, or pass None to leave no active workshop."""
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE workshops SET is_active=0"))
+        if workshop_id:
+            conn.execute(
+                text("UPDATE workshops SET is_active=1 WHERE workshop_id=:wid"),
+                {"wid": workshop_id},
+            )
+    clear_configuration_cache()
+
+
+def delete_workshop(workshop_id):
+    """Permanently remove a workshop and all of its associated data/configuration."""
+    with engine.begin() as conn:
+        conn.execute(
+            text("DELETE FROM participant_submissions WHERE workshop_id=:wid"),
+            {"wid": workshop_id},
+        )
+        conn.execute(
+            text("DELETE FROM breakout_consensus WHERE workshop_id=:wid"),
+            {"wid": workshop_id},
+        )
+        conn.execute(
+            text("DELETE FROM workshop_breakouts WHERE workshop_id=:wid"),
+            {"wid": workshop_id},
+        )
+        conn.execute(
+            text("DELETE FROM workshop_state WHERE workshop_id=:wid"),
+            {"wid": workshop_id},
+        )
+        conn.execute(
+            text("DELETE FROM workshops WHERE workshop_id=:wid"),
+            {"wid": workshop_id},
+        )
+    clear_configuration_cache()
+    st.session_state.pop(f"fac_snapshot_{workshop_id}", None)
+    st.session_state.pop(f"fac_state_{workshop_id}", None)
+    st.session_state.pop(f"public_results_snapshot_{workshop_id}", None)
+    st.session_state.pop(f"public_results_token_{workshop_id}", None)
+
 # -----------------------------------------------------------------------------
 # Shared analysis
 # -----------------------------------------------------------------------------
@@ -1650,7 +1692,7 @@ def participant_view():
     st.subheader("Where would you allocate scarce attention and resources?")
 
     # Participants can only enter the facilitator-designated active workshop.
-    active = active_workshop_cached()
+    active = active_workshop_direct()
     if not active:
         st.warning("There is currently no active workshop. Please wait for the facilitator.")
         return
@@ -2111,6 +2153,18 @@ def facilitator_view():
     wid = select_workshop("Workshop", key="fac_workshop")
     if not wid:
         return
+
+    active_now = active_workshop_direct()
+    if active_now and active_now["workshop_id"] == wid:
+        st.success(f"Active workshop · {active_now['workshop_name']}")
+    elif active_now:
+        st.info(
+            f"You are viewing an inactive workshop. Public Participant and Results pages currently use "
+            f"**{active_now['workshop_name']}**."
+        )
+    else:
+        st.warning("No workshop is active. Participant submissions and public Results are currently unavailable.")
+
     live_controls(wid)
 
     refresh_col, info_col = st.columns([1.2, 3.8])
@@ -2123,9 +2177,17 @@ def facilitator_view():
         )
 
     snapshot = get_facilitator_snapshot(wid, force=refresh_clicked)
-    if refresh_clicked:
-        # Publish this refresh to the public Results view.
+    active_now = active_workshop_direct()
+    is_active_view = bool(active_now and active_now["workshop_id"] == wid)
+
+    if refresh_clicked and is_active_view:
+        # Only the active workshop can publish to the public Results view.
         touch_results_snapshot(wid)
+    elif refresh_clicked and not is_active_view:
+        st.warning(
+            "This workshop snapshot was refreshed for the facilitator, but it was not "
+            "published to the public Results page because it is not the active workshop."
+        )
     participants = snapshot["participants"]
     consensus = snapshot["consensus"]
     breakouts = snapshot["breakouts"]
@@ -2246,44 +2308,16 @@ def facilitator_view():
 
 
 @st.fragment(run_every="5s")
-def public_results_fragment(wid):
+def public_results_fragment():
     """
-    Public results page.
-    Polls only the tiny workshop_state timestamp. Full result tables are reloaded
-    only after the facilitator presses Refresh results and changes that timestamp.
+    Public results always follows the facilitator-designated active workshop.
+    Every five seconds it checks only:
+      1. which workshop is active
+      2. that workshop's lightweight state timestamp
+    Full result tables reload only when the active workshop changes or the
+    facilitator presses Refresh results for the active workshop.
     """
-    state = load_workshop_state(wid)
-    token = state.get("updated_at")
-    token_key = f"public_results_token_{wid}"
-    snapshot_key = f"public_results_snapshot_{wid}"
-
-    if st.session_state.get(token_key) != token or snapshot_key not in st.session_state:
-        st.session_state[token_key] = token
-        st.session_state[snapshot_key] = {
-            "participants": load_participants(wid),
-            "consensus": load_consensus(wid),
-            "breakouts": load_breakouts_cached(wid),
-            "published_at": token,
-        }
-
-    snapshot = st.session_state[snapshot_key]
-    published_at = snapshot.get("published_at") or "Not yet refreshed"
-    st.caption(f"Published results snapshot: {published_at}")
-
-    render_breakout_comparison(
-        snapshot["participants"],
-        snapshot["consensus"],
-        snapshot["breakouts"],
-        wid,
-        key_prefix="public",
-    )
-
-
-def results_view():
-    st.markdown('<div class="section-label">Results</div>', unsafe_allow_html=True)
-    st.subheader("Workshop results")
-
-    active = active_workshop_cached()
+    active = active_workshop_direct()
     if not active:
         st.warning("There is currently no active workshop.")
         return
@@ -2299,11 +2333,46 @@ def results_view():
         disabled=True,
         key=f"results_active_workshop_{wid}",
     )
+
+    state = load_workshop_state(wid)
+    token = state.get("updated_at")
+    active_key = "public_results_current_active"
+    token_key = f"public_results_token_{wid}"
+    snapshot_key = f"public_results_snapshot_{wid}"
+
+    active_changed = st.session_state.get(active_key) != wid
+    token_changed = st.session_state.get(token_key) != token
+
+    if active_changed or token_changed or snapshot_key not in st.session_state:
+        st.session_state[active_key] = wid
+        st.session_state[token_key] = token
+        st.session_state[snapshot_key] = {
+            "participants": load_participants(wid),
+            "consensus": load_consensus(wid),
+            "breakouts": load_breakouts_cached(wid),
+            "published_at": token,
+        }
+
+    snapshot = st.session_state[snapshot_key]
     st.caption(
-        "This public view mirrors the facilitator's Breakout comparison tab. "
-        "It updates when the facilitator publishes a refreshed results snapshot."
+        "This public view follows the active workshop configured by the facilitator. "
+        f"Published results snapshot: {snapshot.get('published_at') or 'Not yet refreshed'}"
     )
-    public_results_fragment(wid)
+
+    render_breakout_comparison(
+        snapshot["participants"],
+        snapshot["consensus"],
+        snapshot["breakouts"],
+        wid,
+        key_prefix="public",
+    )
+
+
+def results_view():
+    st.markdown('<div class="section-label">Results</div>', unsafe_allow_html=True)
+    st.subheader("Workshop results")
+    public_results_fragment()
+
 
 
 # -----------------------------------------------------------------------------
@@ -2311,7 +2380,7 @@ def results_view():
 # -----------------------------------------------------------------------------
 def workshop_configuration_view():
     st.markdown('<div class="section-label">Admin · workshop configuration</div>', unsafe_allow_html=True)
-    st.subheader("Configure the room before participants arrive")
+    st.subheader("Configure and control the active workshop")
     if not check_facilitator_pin(key="config_facilitator_pin"):
         return
 
@@ -2320,87 +2389,263 @@ def workshop_configuration_view():
     else:
         st.error(f"Database connection problem: {database_backend_label()}")
 
-    with st.expander("Create a new workshop", expanded=load_workshops().empty):
+    # ------------------------------------------------------------------
+    # ACTIVE WORKSHOP CONTROL
+    # ------------------------------------------------------------------
+    st.markdown("### Active workshop")
+    st.caption(
+        "There is one source of truth. The active workshop is automatically used by "
+        "Participant submissions and the public Results page."
+    )
+
+    workshops = load_workshops()
+    if workshops.empty:
+        st.info("No workshops exist yet. Create one below.")
+        active = None
+    else:
+        active_rows = workshops[workshops["is_active"] == 1]
+        active = None if active_rows.empty else active_rows.iloc[0].to_dict()
+
+        options = ["__NONE__"] + workshops["workshop_id"].tolist()
+        labels = {"__NONE__": "No active workshop"}
+        for _, r in workshops.iterrows():
+            suffix = " · ACTIVE" if bool(r["is_active"]) else ""
+            labels[r["workshop_id"]] = (
+                f'{r["workshop_name"]} · {r["event_name"] or "Workshop"}{suffix}'
+            )
+
+        current = active["workshop_id"] if active else "__NONE__"
+        selected_active = st.selectbox(
+            "Workshop used by participants and public Results",
+            options,
+            index=options.index(current),
+            format_func=lambda x: labels[x],
+            key="active_workshop_control",
+        )
+
+        c1, c2 = st.columns([1.3, 3.7])
+        with c1:
+            if st.button(
+                "Apply active workshop",
+                type="primary",
+                use_container_width=True,
+                key="apply_active_workshop",
+            ):
+                set_active_workshop(
+                    None if selected_active == "__NONE__" else selected_active
+                )
+                # Clear public session snapshot so this browser follows immediately.
+                st.session_state.pop("public_results_current_active", None)
+                st.success("Active workshop updated.")
+                st.rerun()
+        with c2:
+            if active:
+                st.markdown(
+                    f'<div class="callout"><b>Currently active:</b> {active["workshop_name"]}. '
+                    'This is the workshop participants can submit to and the Results page displays.</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    '<div class="callout"><b>No workshop is active.</b> Participant submission and public Results are disabled.</div>',
+                    unsafe_allow_html=True,
+                )
+
+    st.markdown("---")
+
+    # ------------------------------------------------------------------
+    # CREATE WORKSHOP
+    # ------------------------------------------------------------------
+    with st.expander("Create a new workshop", expanded=workshops.empty):
+        st.caption(
+            "A new workshop is created inactive. Set it as Active above when you are ready "
+            "for participants to use it."
+        )
         with st.form("create_workshop_form"):
             c1, c2 = st.columns(2)
             with c1:
-                workshop_name = st.text_input("Workshop name", placeholder="CDR Barrier Auction")
-                event_name = st.text_input("Event / programme", placeholder="New York Climate Week 2026")
+                workshop_name = st.text_input(
+                    "Workshop name",
+                    placeholder="CDR Barrier Auction",
+                )
+                event_name = st.text_input(
+                    "Event / programme",
+                    placeholder="New York Climate Week 2026",
+                )
                 event_date = st.date_input("Event date")
             with c2:
-                participant_target = st.number_input("Expected participants", 1, 1000, 40)
-                duration_minutes = st.number_input("Workshop duration (minutes)", 10, 240, 45)
-                number_breakouts = st.number_input("Number of breakout groups", 1, 30, 5)
-            code_style = st.selectbox("Default breakout codes", ["B1, B2, B3…", "BLUE1, BLUE2, BLUE3…"])
-            create = st.form_submit_button("Create workshop", type="primary", use_container_width=True)
+                participant_target = st.number_input(
+                    "Expected participants", 1, 1000, 40
+                )
+                duration_minutes = st.number_input(
+                    "Workshop duration (minutes)", 10, 240, 45
+                )
+                number_breakouts = st.number_input(
+                    "Number of breakout groups", 1, 30, 5
+                )
+            code_style = st.selectbox(
+                "Default breakout codes",
+                ["B1, B2, B3…", "BLUE1, BLUE2, BLUE3…"],
+            )
+            create = st.form_submit_button(
+                "Create workshop",
+                type="primary",
+                use_container_width=True,
+            )
+
         if create:
             if not workshop_name.strip():
                 st.error("Workshop name is required.")
             else:
-                wid = f"WS-{uuid.uuid4().hex[:8].upper()}"
-                codes = [f"BLUE{i}" if code_style.startswith("BLUE") else f"B{i}" for i in range(1, int(number_breakouts)+1)]
+                wid_new = f"WS-{uuid.uuid4().hex[:8].upper()}"
+                codes = [
+                    f"BLUE{i}" if code_style.startswith("BLUE") else f"B{i}"
+                    for i in range(1, int(number_breakouts) + 1)
+                ]
                 try:
                     with engine.begin() as conn:
-                        conn.execute(text("UPDATE workshops SET is_active=0"))
                         conn.execute(text("""
-                            INSERT INTO workshops (workshop_id, workshop_name, event_name, event_date, participant_target, duration_minutes, is_active, created_at)
-                            VALUES (:wid,:name,:event,:date,:target,:duration,1,:created)
-                        """), {"wid":wid,"name":workshop_name.strip(),"event":event_name.strip(),"date":str(event_date),"target":int(participant_target),"duration":int(duration_minutes),"created":now_iso()})
-                        conn.execute(text("INSERT INTO workshop_state (workshop_id, submissions_locked, results_revealed, updated_at) VALUES (:wid,0,0,:updated)"), {"wid":wid,"updated":now_iso()})
-                        for i, code in enumerate(codes,1):
+                            INSERT INTO workshops (
+                                workshop_id, workshop_name, event_name, event_date,
+                                participant_target, duration_minutes, is_active, created_at
+                            )
+                            VALUES (
+                                :wid,:name,:event,:date,:target,:duration,0,:created
+                            )
+                        """), {
+                            "wid": wid_new,
+                            "name": workshop_name.strip(),
+                            "event": event_name.strip(),
+                            "date": str(event_date),
+                            "target": int(participant_target),
+                            "duration": int(duration_minutes),
+                            "created": now_iso(),
+                        })
+                        conn.execute(text("""
+                            INSERT INTO workshop_state (
+                                workshop_id, submissions_locked, results_revealed, updated_at
+                            )
+                            VALUES (:wid,0,0,:updated)
+                        """), {"wid": wid_new, "updated": now_iso()})
+                        for i, code in enumerate(codes, 1):
                             conn.execute(text("""
-                                INSERT INTO workshop_breakouts
-                                    (workshop_id, breakout_code, breakout_name)
+                                INSERT INTO workshop_breakouts (
+                                    workshop_id, breakout_code, breakout_name
+                                )
                                 VALUES (:wid,:code,:name)
-                            """), {"wid":wid,"code":code,"name":f"Breakout {i}"})
+                            """), {
+                                "wid": wid_new,
+                                "code": code,
+                                "name": f"Breakout {i}",
+                            })
                     clear_configuration_cache()
-                    st.success("Workshop created.")
+                    st.success(
+                        "Workshop created as inactive. Select it under Active workshop when ready."
+                    )
                     st.rerun()
                 except Exception as exc:
-                    st.error(
-                        "The workshop could not be created. The most likely cause is an older "
-                        "database schema retained from a previous deployment. V1.1.0 includes "
-                        "database-aware migrations for both SQLite and PostgreSQL/Supabase. "
-                        "Restart/redeploy once and try again."
-                    )
+                    st.error("The workshop could not be created.")
                     st.exception(exc)
 
-    wid = select_workshop("Workshop to manage", key="config_workshop")
-    if not wid:
-        return
+    # Reload after any create path.
     workshops = load_workshops()
+    if workshops.empty:
+        return
+
+    st.markdown("---")
+
+    # ------------------------------------------------------------------
+    # MANAGE ONE WORKSHOP
+    # ------------------------------------------------------------------
+    st.markdown("### Manage workshop")
+    st.caption(
+        "Selecting a workshop here does not make it active. Use the Active workshop control above "
+        "to determine what participants and the public Results page use."
+    )
+
+    options = workshops["workshop_id"].tolist()
+    active_rows = workshops[workshops["is_active"] == 1]
+    default_manage = (
+        active_rows.iloc[0]["workshop_id"]
+        if not active_rows.empty
+        else options[0]
+    )
+
+    wid = st.selectbox(
+        "Workshop to manage",
+        options,
+        index=options.index(default_manage),
+        format_func=lambda x: (
+            workshops.loc[workshops["workshop_id"] == x, "workshop_name"].iloc[0]
+            + (
+                " · ACTIVE"
+                if bool(
+                    workshops.loc[
+                        workshops["workshop_id"] == x, "is_active"
+                    ].iloc[0]
+                )
+                else ""
+            )
+        ),
+        key="config_workshop",
+    )
+
     row = workshops[workshops["workshop_id"] == wid].iloc[0]
     c1, c2, c3 = st.columns(3)
     c1.metric("Expected participants", int(row["participant_target"] or 0))
     c2.metric("Duration", f"{int(row['duration_minutes'] or 0)} min")
-    c3.metric("Status", "Active" if bool(row["is_active"]) else "Inactive")
-    if not bool(row["is_active"]) and st.button("Make this the active workshop", use_container_width=True):
-        with engine.begin() as conn:
-            conn.execute(text("UPDATE workshops SET is_active=0"))
-            conn.execute(text("UPDATE workshops SET is_active=1 WHERE workshop_id=:wid"), {"wid":wid})
-        clear_configuration_cache()
-        st.rerun()
+    c3.metric("Status", "ACTIVE" if bool(row["is_active"]) else "Inactive")
 
     st.markdown("### Breakout groups")
     breakouts = load_breakouts(wid)
     edited = st.data_editor(
-        breakouts[["breakout_code", "breakout_name"]].copy(), hide_index=True, num_rows="dynamic", use_container_width=True,
-        column_config={"breakout_code": st.column_config.TextColumn("Code", required=True), "breakout_name": st.column_config.TextColumn("Name")},
+        breakouts[["breakout_code", "breakout_name"]].copy(),
+        hide_index=True,
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={
+            "breakout_code": st.column_config.TextColumn("Code", required=True),
+            "breakout_name": st.column_config.TextColumn("Name"),
+        },
+        key=f"breakout_editor_{wid}",
     )
-    if st.button("Save breakout groups", type="primary", use_container_width=True):
+
+    if st.button(
+        "Save breakout groups",
+        type="primary",
+        use_container_width=True,
+        key=f"save_breakouts_{wid}",
+    ):
         clean = edited.copy()
-        clean["breakout_code"] = clean["breakout_code"].astype(str).str.strip().str.upper()
-        clean["breakout_name"] = clean["breakout_name"].fillna("").astype(str).str.strip()
+        clean["breakout_code"] = (
+            clean["breakout_code"].astype(str).str.strip().str.upper()
+        )
+        clean["breakout_name"] = (
+            clean["breakout_name"].fillna("").astype(str).str.strip()
+        )
         clean = clean[clean["breakout_code"] != ""]
+
         if clean["breakout_code"].duplicated().any():
             st.error("Breakout codes must be unique.")
         else:
             with engine.begin() as conn:
-                conn.execute(text("DELETE FROM workshop_breakouts WHERE workshop_id=:wid"), {"wid":wid})
+                conn.execute(
+                    text("DELETE FROM workshop_breakouts WHERE workshop_id=:wid"),
+                    {"wid": wid},
+                )
                 for _, br in clean.iterrows():
-                    conn.execute(text("INSERT INTO workshop_breakouts (workshop_id, breakout_code, breakout_name) VALUES (:wid,:code,:name)"), {"wid":wid,"code":br["breakout_code"],"name":br["breakout_name"]})
+                    conn.execute(text("""
+                        INSERT INTO workshop_breakouts (
+                            workshop_id, breakout_code, breakout_name
+                        )
+                        VALUES (:wid,:code,:name)
+                    """), {
+                        "wid": wid,
+                        "code": br["breakout_code"],
+                        "name": br["breakout_name"],
+                    })
             clear_configuration_cache()
-            st.success("Breakouts saved.")
+            st.success("Breakout groups saved.")
             st.rerun()
 
     st.markdown("### Submission status")
@@ -2410,20 +2655,22 @@ def workshop_configuration_view():
     else:
         st.dataframe(status_df, hide_index=True, use_container_width=True)
 
+    # ------------------------------------------------------------------
+    # RESET RESPONSES
+    # ------------------------------------------------------------------
     st.markdown("---")
-    st.markdown("### Danger zone")
+    st.markdown("### Reset workshop responses")
     st.warning(
-        "Resetting this workshop permanently deletes participant submissions, breakout consensus "
-        "allocations and qualitative responses for this workshop. Workshop configuration and breakout "
-        "groups are retained."
+        "This clears participant submissions, breakout decisions and qualitative responses, "
+        "but keeps the workshop configuration and breakout groups."
     )
     reset_confirmation = st.text_input(
-        "Type RESET to confirm",
+        "Type RESET to clear responses",
         key=f"reset_confirm_{wid}",
         placeholder="RESET",
     )
     if st.button(
-        "Permanently clear workshop responses",
+        "Clear responses only",
         disabled=reset_confirmation.strip().upper() != "RESET",
         use_container_width=True,
         key=f"reset_button_{wid}",
@@ -2434,21 +2681,59 @@ def workshop_configuration_view():
         st.session_state.pop(f"fac_state_{wid}", None)
         st.session_state.pop(f"public_results_snapshot_{wid}", None)
         st.session_state.pop(f"public_results_token_{wid}", None)
-        st.success("Workshop responses cleared. Configuration and breakout groups were retained.")
+        st.success("Responses cleared; workshop configuration retained.")
+        st.rerun()
+
+    # ------------------------------------------------------------------
+    # DELETE ENTIRE WORKSHOP
+    # ------------------------------------------------------------------
+    st.markdown("---")
+    st.markdown("### Delete entire workshop")
+    st.error(
+        "This permanently removes the workshop configuration, breakout groups, participant "
+        "submissions, breakout decisions and results. This cannot be undone."
+    )
+    delete_confirmation = st.text_input(
+        "Type DELETE to permanently remove this workshop",
+        key=f"delete_confirm_{wid}",
+        placeholder="DELETE",
+    )
+    if st.button(
+        "Delete entire workshop",
+        disabled=delete_confirmation.strip().upper() != "DELETE",
+        use_container_width=True,
+        key=f"delete_workshop_{wid}",
+    ):
+        was_active = bool(row["is_active"])
+        delete_workshop(wid)
+        if was_active:
+            # Deliberately leave no active workshop rather than silently choosing another.
+            set_active_workshop(None)
+        st.success(
+            "Workshop permanently deleted. "
+            + ("No workshop is active; choose one explicitly above." if was_active else "")
+        )
         st.rerun()
 
     st.markdown("### Links")
-    base_url = st.text_input("Deployed app URL", placeholder="https://your-app.streamlit.app").rstrip("/")
+    base_url = st.text_input(
+        "Deployed app URL",
+        placeholder="https://your-app.streamlit.app",
+    ).rstrip("/")
     if base_url:
         st.markdown("**Participant links**")
         for _, br in load_breakouts(wid).iterrows():
-            st.code(f"{base_url}/?workshop={wid}&group={br['breakout_code']}", language=None)
-        st.markdown("**Breakout lead links**")
-        for _, br in load_breakouts(wid).iterrows():
-            st.code(f"{base_url}/?lead=1&workshop={wid}&group={br['breakout_code']}", language=None)
-        st.markdown("**Facilitator link**")
+            st.code(
+                f"{base_url}/?group={br['breakout_code']}",
+                language=None,
+            )
+        st.caption(
+            "Participant links no longer carry a workshop ID. They always resolve against "
+            "the currently active workshop."
+        )
+        st.markdown("**Facilitator / Results link**")
         st.code(base_url, language=None)
-        st.caption("Facilitator and Workshop configuration remain protected by the facilitator PIN.")
+
 
 # -----------------------------------------------------------------------------
 # Navigation
@@ -2461,7 +2746,7 @@ default_idx = 2 if lead_mode else 0
 
 mode = st.sidebar.radio("View", nav_options, index=default_idx)
 st.sidebar.markdown("---")
-st.sidebar.caption("WBCSD · CDR Decision Lab · Version 1.1.2")
+st.sidebar.caption("WBCSD · CDR Decision Lab · Version 1.1.3")
 st.sidebar.caption("Participant and Results are public. Breakout lead and facilitator/admin areas use separate PINs.")
 
 if mode == "Participant":

@@ -1,3 +1,31 @@
+# V1.1.3 workshop lifecycle / active-workshop release
+
+## One active workshop is now the single source of truth
+Workshop Configuration has a dedicated **Active workshop** control. The selected active workshop is used by:
+- Participant submissions
+- Public Results
+- Facilitator publishing
+
+Selecting a workshop under **Manage workshop** does NOT implicitly make it active.
+
+## Participant links
+Participant URLs now only need the breakout code, e.g. `?group=B1`. The active workshop is resolved by the app, avoiding stale workshop IDs in old links.
+
+## Public Results alignment
+The Results page now checks which workshop is active every few seconds. If the facilitator changes the active workshop, the public Results page follows it automatically.
+
+The facilitator can analyse historical/inactive workshops, but pressing Refresh on an inactive workshop does not publish it to public Results.
+
+## Workshop lifecycle controls
+Workshop Configuration now supports:
+- Create workshop (created inactive)
+- Explicitly set / clear the active workshop
+- Manage breakout groups
+- Reset responses only
+- Permanently delete the entire workshop and all associated data
+
+If the active workshop is deleted, the app deliberately leaves **no active workshop** until the facilitator explicitly selects another one.
+
 # V1.1.2 active-workshop and public-results release
 
 ## Participant workshop control

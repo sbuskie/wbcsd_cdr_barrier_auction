@@ -463,6 +463,39 @@ def active_workshop():
     active = df[df["is_active"] == 1]
     return None if active.empty else active.iloc[0].to_dict()
 
+
+def active_workshop_cached():
+    df = load_workshops_cached()
+    active = df[df["is_active"] == 1]
+    return None if active.empty else active.iloc[0].to_dict()
+
+
+def active_workshop_direct():
+    """Fresh DB check used only at submission time."""
+    with engine.connect() as conn:
+        row = conn.execute(text("""
+            SELECT workshop_id, workshop_name, event_name, event_date,
+                   participant_target, duration_minutes, is_active, created_at
+            FROM workshops
+            WHERE is_active=1
+            ORDER BY created_at DESC
+            LIMIT 1
+        """)).mappings().first()
+    return dict(row) if row else None
+
+
+def touch_results_snapshot(workshop_id):
+    """Signal public Results views that the facilitator published a new snapshot."""
+    with engine.begin() as conn:
+        conn.execute(
+            text("""
+                UPDATE workshop_state
+                SET updated_at=:updated
+                WHERE workshop_id=:wid
+            """),
+            {"wid": workshop_id, "updated": now_iso()},
+        )
+
 # -----------------------------------------------------------------------------
 # Shared analysis
 # -----------------------------------------------------------------------------
@@ -1551,7 +1584,16 @@ def participant_input_fragment(wid, breakouts, default_breakout_index):
         use_container_width=True,
         key=f"p_submit_{wid}",
     ):
-        # First database call since the participant opened the input interface.
+        # Fresh database checks only when the participant actually submits.
+        active_now = active_workshop_direct()
+        if not active_now or active_now["workshop_id"] != wid:
+            st.error(
+                "This workshop is no longer active. Your response was not saved. "
+                "Refresh the page to join the active workshop."
+            )
+            clear_configuration_cache()
+            return
+
         current_state = load_workshop_state(wid)
         if bool(current_state["submissions_locked"]):
             st.error("Submissions were just locked by the facilitator. Your response was not saved.")
@@ -1607,38 +1649,30 @@ def participant_view():
     st.markdown('<div class="section-label">01 · Individual perspective</div>', unsafe_allow_html=True)
     st.subheader("Where would you allocate scarce attention and resources?")
 
-    # Slow-changing configuration is cached for five minutes.
-    workshops = load_workshops_cached()
-    if workshops.empty:
-        st.warning("No workshop has been configured yet.")
+    # Participants can only enter the facilitator-designated active workshop.
+    active = active_workshop_cached()
+    if not active:
+        st.warning("There is currently no active workshop. Please wait for the facilitator.")
         return
 
-    preset_workshop = st.query_params.get("workshop", "")
+    wid = active["workshop_id"]
+    workshop_display = active["workshop_name"]
+    if active.get("event_name"):
+        workshop_display += f" · {active['event_name']}"
+
+    # Visibly fixed/greyed-out field: participants cannot choose another workshop.
+    st.text_input(
+        "Active workshop",
+        value=workshop_display,
+        disabled=True,
+        key=f"participant_active_workshop_{wid}",
+    )
+    st.caption("The facilitator controls the active workshop. Participant submissions can only be written to this workshop.")
+
     preset_breakout = st.query_params.get("group", "").upper()
-
-    active_rows = workshops[workshops["is_active"] == 1]
-    active = None if active_rows.empty else active_rows.iloc[0].to_dict()
-
-    workshop_options = workshops["workshop_id"].tolist()
-    default_wid = (
-        preset_workshop
-        if preset_workshop in workshop_options
-        else (active["workshop_id"] if active else workshop_options[0])
-    )
-
-    wid = st.selectbox(
-        "Workshop",
-        workshop_options,
-        index=workshop_options.index(default_wid),
-        format_func=lambda x: workshops.loc[
-            workshops["workshop_id"] == x, "workshop_name"
-        ].iloc[0],
-        key="participant_workshop",
-    )
-
     breakouts = load_breakouts_cached(wid)
     if breakouts.empty:
-        st.warning("This workshop has no breakout groups configured.")
+        st.warning("The active workshop has no breakout groups configured.")
         return
 
     breakout_codes = breakouts["breakout_code"].tolist()
@@ -1650,19 +1684,14 @@ def participant_view():
 
     submitted_key = f"submitted_{wid}"
     if st.session_state.get(submitted_key):
-        breakout_code = st.session_state.get(f"submitted_breakout_{wid}")
-        participant_reveal_fragment(wid, breakout_code)
-        if st.button(
-            "Submit another test response",
-            help="Useful during testing; remove this option for a production event if desired.",
-        ):
-            st.session_state[submitted_key] = False
-            st.rerun()
+        st.success("Your allocation has been submitted.")
+        st.info(
+            "You can now open the public Results view from the sidebar. "
+            "Results are published when the facilitator refreshes the workshop snapshot."
+        )
         return
 
-    # Read workshop state once when this full page is entered. It is deliberately
-    # not re-read while the participant edits allocations. Submit re-checks the
-    # lock directly against the database before writing.
+    # Read lock state once on entry; submit re-checks it directly before writing.
     participant_state_key = f"participant_initial_state_{wid}"
     if participant_state_key not in st.session_state:
         st.session_state[participant_state_key] = load_workshop_state(wid)
@@ -1674,8 +1703,6 @@ def participant_view():
             'The facilitator has closed the individual allocation stage.</div>',
             unsafe_allow_html=True,
         )
-        if bool(state["results_revealed"]):
-            participant_reveal_fragment(wid, breakout_codes[default_breakout_index])
         return
 
     participant_input_fragment(wid, breakouts, default_breakout_index)
@@ -1802,6 +1829,174 @@ def breakout_lead_view():
 # -----------------------------------------------------------------------------
 # Facilitator dashboard
 # -----------------------------------------------------------------------------
+
+def render_breakout_comparison(participants, consensus, breakouts, wid, key_prefix):
+    """Shared comparison view used by Facilitator and public Results."""
+    if participants.empty:
+        st.info("No participant submissions have been published yet.")
+        return
+
+    st.markdown("### Every breakout · participant range vs coordinated decision")
+    st.caption(
+        "For each breakout, the range is the lowest-to-highest participant response, "
+        "the coloured dot is the participant average, and the charcoal diamond is the final breakout allocation."
+    )
+    for code in breakouts["breakout_code"].tolist():
+        g = participants[participants["breakout_code"] == code]
+        if g.empty:
+            continue
+        cdf = consensus[consensus["breakout_code"] == code]
+        crow = cdf.iloc[0].to_dict() if not cdf.empty else None
+        with st.expander(f"{code} · {len(g)} participant responses", expanded=False):
+            lcol, rcol = st.columns(2)
+            with lcol:
+                st.plotly_chart(
+                    range_plot_with_consensus(
+                        g, INTERNAL_DB, "Internal barriers", COLORS["orange"], crow
+                    ),
+                    use_container_width=True,
+                    key=f"{key_prefix}_range_int_{wid}_{code}",
+                )
+            with rcol:
+                st.plotly_chart(
+                    range_plot_with_consensus(
+                        g, EXTERNAL_DB, "External enabling environment", COLORS["spruce"], crow
+                    ),
+                    use_container_width=True,
+                    key=f"{key_prefix}_range_ext_{wid}_{code}",
+                )
+
+    st.markdown("### Final coordinated allocation · breakout comparison")
+    if consensus.empty:
+        st.info("No breakout coordinated allocations have been submitted yet.")
+    else:
+        lcol, rcol = st.columns(2)
+        with lcol:
+            fig = consensus_comparison_chart(
+                consensus, INTERNAL_DB, "Internal budget allocation by breakout"
+            )
+            if fig is not None:
+                st.plotly_chart(
+                    fig, use_container_width=True,
+                    key=f"{key_prefix}_consensus_int_{wid}",
+                )
+        with rcol:
+            fig = consensus_comparison_chart(
+                consensus, EXTERNAL_DB, "External enabling priorities by breakout"
+            )
+            if fig is not None:
+                st.plotly_chart(
+                    fig, use_container_width=True,
+                    key=f"{key_prefix}_consensus_ext_{wid}",
+                )
+
+    st.markdown("### Priority heat maps")
+    hi, he = st.tabs(["Internal", "External"])
+    with hi:
+        fig = breakout_heatmap(
+            participants, INTERNAL_DB, "mean",
+            "Average internal allocation by breakout"
+        )
+        if fig:
+            st.plotly_chart(
+                fig, use_container_width=True,
+                key=f"{key_prefix}_priority_int_{wid}",
+            )
+    with he:
+        fig = breakout_heatmap(
+            participants, EXTERNAL_DB, "mean",
+            "Average external allocation by breakout"
+        )
+        if fig:
+            st.plotly_chart(
+                fig, use_container_width=True,
+                key=f"{key_prefix}_priority_ext_{wid}",
+            )
+
+    st.markdown("### Agreement heat maps")
+    ai, ae = st.tabs(["Internal", "External"])
+    with ai:
+        fig = breakout_heatmap(
+            participants, INTERNAL_DB, "std",
+            "Internal disagreement by breakout · higher = more divergent"
+        )
+        if fig:
+            st.plotly_chart(
+                fig, use_container_width=True,
+                key=f"{key_prefix}_agreement_int_{wid}",
+            )
+    with ae:
+        fig = breakout_heatmap(
+            participants, EXTERNAL_DB, "std",
+            "External disagreement by breakout · higher = more divergent"
+        )
+        if fig:
+            st.plotly_chart(
+                fig, use_container_width=True,
+                key=f"{key_prefix}_agreement_ext_{wid}",
+            )
+
+    st.markdown("### Compare one barrier across breakouts")
+    category = st.radio(
+        "Barrier type",
+        ["Internal", "External"],
+        horizontal=True,
+        key=f"{key_prefix}_barrier_type_{wid}",
+    )
+    mapping = INTERNAL_DB if category == "Internal" else EXTERNAL_DB
+    barrier = st.selectbox(
+        "Barrier",
+        list(mapping.keys()),
+        key=f"{key_prefix}_barrier_{wid}",
+    )
+    col = mapping[barrier]
+
+    rows = []
+    for code, g in participants.groupby("breakout_code"):
+        rows.append({
+            "Breakout": code,
+            "Low": g[col].min(),
+            "Average": g[col].mean(),
+            "High": g[col].max(),
+            "Std dev": g[col].std(ddof=0),
+        })
+    comp = pd.DataFrame(rows).sort_values("Average", ascending=True)
+
+    fig = go.Figure()
+    for _, r in comp.iterrows():
+        fig.add_trace(go.Scatter(
+            x=[r["Low"], r["High"]],
+            y=[r["Breakout"], r["Breakout"]],
+            mode="lines",
+            line=dict(color=COLORS["sand"], width=9),
+            showlegend=False,
+            hoverinfo="skip",
+        ))
+    fig.add_trace(go.Scatter(
+        x=comp["Average"],
+        y=comp["Breakout"],
+        mode="markers",
+        marker=dict(size=13, color=COLORS["orange"]),
+        showlegend=False,
+        customdata=np.stack([comp["Low"], comp["High"], comp["Std dev"]], axis=-1),
+        hovertemplate=(
+            "%{y}<br>Average %{x:.1f}<br>Low %{customdata[0]:.1f}"
+            "<br>High %{customdata[1]:.1f}<br>Std dev %{customdata[2]:.1f}<extra></extra>"
+        ),
+    ))
+    fig.update_layout(
+        title=barrier,
+        xaxis=dict(range=[0,100], title="Allocation units"),
+        yaxis_title=None,
+        height=max(300, 65*len(comp)),
+        plot_bgcolor="white",
+    )
+    st.plotly_chart(
+        fig, use_container_width=True,
+        key=f"{key_prefix}_barrier_plot_{wid}",
+    )
+
+
 def get_facilitator_snapshot(wid, force=False):
     """
     Keep a local session snapshot of workshop results.
@@ -1881,8 +2076,8 @@ def get_facilitator_state(wid):
 
 def live_controls(wid):
     state = get_facilitator_state(wid)
-    st.markdown("### Live workshop controls")
-    c1, c2, c3 = st.columns([1.3, 1.3, 2.4])
+    st.markdown("### Submission controls")
+    c1, c2 = st.columns([1.4, 3.6])
 
     with c1:
         if bool(state["submissions_locked"]):
@@ -1899,26 +2094,10 @@ def live_controls(wid):
                 st.rerun()
 
     with c2:
-        if bool(state["results_revealed"]):
-            if st.button("Hide results", use_container_width=True):
-                update_workshop_state(wid, revealed=0)
-                state["results_revealed"] = 0
-                st.session_state[f"fac_state_{wid}"] = state
-                st.rerun()
-        else:
-            if st.button("Reveal results", type="primary", use_container_width=True):
-                update_workshop_state(wid, revealed=1)
-                state["results_revealed"] = 1
-                st.session_state[f"fac_state_{wid}"] = state
-                st.rerun()
-
-    with c3:
-        status = [
-            "Submissions locked" if state["submissions_locked"] else "Submissions open",
-            "Results visible to participants" if state["results_revealed"] else "Results hidden",
-        ]
+        status = "Submissions locked" if state["submissions_locked"] else "Submissions open"
         st.markdown(
-            f'<div class="callout"><b>Stage:</b> {" · ".join(status)}</div>',
+            f'<div class="callout"><b>Status:</b> {status}. '
+            'Results are always available through the public Results view and update when you press Refresh results.</div>',
             unsafe_allow_html=True,
         )
     return state
@@ -1926,7 +2105,7 @@ def live_controls(wid):
 
 def facilitator_view():
     st.markdown('<div class="section-label">03 · Facilitator</div>', unsafe_allow_html=True)
-    st.subheader("See the room, surface disagreement, and guide the reveal")
+    st.subheader("See the room, surface disagreement, and guide the discussion")
     if not check_facilitator_pin():
         return
     wid = select_workshop("Workshop", key="fac_workshop")
@@ -1944,6 +2123,9 @@ def facilitator_view():
         )
 
     snapshot = get_facilitator_snapshot(wid, force=refresh_clicked)
+    if refresh_clicked:
+        # Publish this refresh to the public Results view.
+        touch_results_snapshot(wid)
     participants = snapshot["participants"]
     consensus = snapshot["consensus"]
     breakouts = snapshot["breakouts"]
@@ -2012,81 +2194,9 @@ def facilitator_view():
         st.dataframe(combined[["Type", "Barrier", "Low", "Average", "High", "Std dev", "Agreement"]], hide_index=True, use_container_width=True)
 
     with comparisons:
-        st.markdown("### Every breakout · participant range vs coordinated decision")
-        st.caption(
-            "For each breakout, the range is the lowest-to-highest participant response, "
-            "the coloured dot is the participant average, and the charcoal diamond is the final breakout allocation."
+        render_breakout_comparison(
+            participants, consensus, breakouts, wid, key_prefix="fac"
         )
-        for code in breakouts["breakout_code"].tolist():
-            g = participants[participants["breakout_code"] == code]
-            if g.empty:
-                continue
-            cdf = consensus[consensus["breakout_code"] == code]
-            crow = cdf.iloc[0].to_dict() if not cdf.empty else None
-            with st.expander(f"{code} · {len(g)} participant responses", expanded=False):
-                lcol, rcol = st.columns(2)
-                with lcol:
-                    st.plotly_chart(
-                        range_plot_with_consensus(g, INTERNAL_DB, "Internal barriers", COLORS["orange"], crow),
-                        use_container_width=True,
-                        key=f"fac_range_int_{wid}_{code}",
-                    )
-                with rcol:
-                    st.plotly_chart(
-                        range_plot_with_consensus(g, EXTERNAL_DB, "External enabling environment", COLORS["spruce"], crow),
-                        use_container_width=True,
-                        key=f"fac_range_ext_{wid}_{code}",
-                    )
-
-        st.markdown("### Final coordinated allocation · breakout comparison")
-        if consensus.empty:
-            st.info("No breakout coordinated allocations have been submitted yet.")
-        else:
-            lcol, rcol = st.columns(2)
-            with lcol:
-                fig = consensus_comparison_chart(consensus, INTERNAL_DB, "Internal budget allocation by breakout")
-                if fig is not None:
-                    st.plotly_chart(fig, use_container_width=True, key=f"fac_consensus_int_{wid}")
-            with rcol:
-                fig = consensus_comparison_chart(consensus, EXTERNAL_DB, "External enabling priorities by breakout")
-                if fig is not None:
-                    st.plotly_chart(fig, use_container_width=True, key=f"fac_consensus_ext_{wid}")
-
-        st.markdown("### Priority heat maps")
-        hi, he = st.tabs(["Internal", "External"])
-        with hi:
-            fig = breakout_heatmap(participants, INTERNAL_DB, "mean", "Average internal allocation by breakout")
-            if fig: st.plotly_chart(fig, use_container_width=True)
-        with he:
-            fig = breakout_heatmap(participants, EXTERNAL_DB, "mean", "Average external allocation by breakout")
-            if fig: st.plotly_chart(fig, use_container_width=True)
-
-        st.markdown("### Agreement heat maps")
-        ai, ae = st.tabs(["Internal", "External"])
-        with ai:
-            fig = breakout_heatmap(participants, INTERNAL_DB, "std", "Internal disagreement by breakout · higher = more divergent")
-            if fig: st.plotly_chart(fig, use_container_width=True)
-        with ae:
-            fig = breakout_heatmap(participants, EXTERNAL_DB, "std", "External disagreement by breakout · higher = more divergent")
-            if fig: st.plotly_chart(fig, use_container_width=True)
-
-        st.markdown("### Compare one barrier across breakouts")
-        category = st.radio("Barrier type", ["Internal", "External"], horizontal=True)
-        mapping = INTERNAL_DB if category == "Internal" else EXTERNAL_DB
-        barrier = st.selectbox("Barrier", list(mapping.keys()))
-        col = mapping[barrier]
-        rows = []
-        for code, g in participants.groupby("breakout_code"):
-            rows.append({"Breakout": code, "Low": g[col].min(), "Average": g[col].mean(), "High": g[col].max(), "Std dev": g[col].std(ddof=0)})
-        comp = pd.DataFrame(rows).sort_values("Average", ascending=True)
-        fig = go.Figure()
-        for _, r in comp.iterrows():
-            fig.add_trace(go.Scatter(x=[r["Low"], r["High"]], y=[r["Breakout"], r["Breakout"]], mode="lines", line=dict(color=COLORS["sand"], width=9), showlegend=False, hoverinfo="skip"))
-        fig.add_trace(go.Scatter(x=comp["Average"], y=comp["Breakout"], mode="markers", marker=dict(size=13, color=COLORS["orange"]), showlegend=False,
-                                 customdata=np.stack([comp["Low"], comp["High"], comp["Std dev"]], axis=-1),
-                                 hovertemplate="%{y}<br>Average %{x:.1f}<br>Low %{customdata[0]:.1f}<br>High %{customdata[1]:.1f}<br>Std dev %{customdata[2]:.1f}<extra></extra>"))
-        fig.update_layout(title=barrier, xaxis=dict(range=[0,100], title="Allocation units"), yaxis_title=None, height=max(300, 65*len(comp)), plot_bgcolor="white")
-        st.plotly_chart(fig, use_container_width=True)
 
     with qualitative:
         texts = participants["biggest_reason"].fillna("")
@@ -2133,6 +2243,68 @@ def facilitator_view():
             file_name="WBCSD_CDR_Decision_Lab_Data.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True,
         )
+
+
+@st.fragment(run_every="5s")
+def public_results_fragment(wid):
+    """
+    Public results page.
+    Polls only the tiny workshop_state timestamp. Full result tables are reloaded
+    only after the facilitator presses Refresh results and changes that timestamp.
+    """
+    state = load_workshop_state(wid)
+    token = state.get("updated_at")
+    token_key = f"public_results_token_{wid}"
+    snapshot_key = f"public_results_snapshot_{wid}"
+
+    if st.session_state.get(token_key) != token or snapshot_key not in st.session_state:
+        st.session_state[token_key] = token
+        st.session_state[snapshot_key] = {
+            "participants": load_participants(wid),
+            "consensus": load_consensus(wid),
+            "breakouts": load_breakouts_cached(wid),
+            "published_at": token,
+        }
+
+    snapshot = st.session_state[snapshot_key]
+    published_at = snapshot.get("published_at") or "Not yet refreshed"
+    st.caption(f"Published results snapshot: {published_at}")
+
+    render_breakout_comparison(
+        snapshot["participants"],
+        snapshot["consensus"],
+        snapshot["breakouts"],
+        wid,
+        key_prefix="public",
+    )
+
+
+def results_view():
+    st.markdown('<div class="section-label">Results</div>', unsafe_allow_html=True)
+    st.subheader("Workshop results")
+
+    active = active_workshop_cached()
+    if not active:
+        st.warning("There is currently no active workshop.")
+        return
+
+    wid = active["workshop_id"]
+    workshop_display = active["workshop_name"]
+    if active.get("event_name"):
+        workshop_display += f" · {active['event_name']}"
+
+    st.text_input(
+        "Active workshop",
+        value=workshop_display,
+        disabled=True,
+        key=f"results_active_workshop_{wid}",
+    )
+    st.caption(
+        "This public view mirrors the facilitator's Breakout comparison tab. "
+        "It updates when the facilitator publishes a refreshed results snapshot."
+    )
+    public_results_fragment(wid)
+
 
 # -----------------------------------------------------------------------------
 # Workshop configuration / admin
@@ -2260,6 +2432,8 @@ def workshop_configuration_view():
         st.session_state[f"reset_confirm_{wid}"] = ""
         st.session_state.pop(f"fac_snapshot_{wid}", None)
         st.session_state.pop(f"fac_state_{wid}", None)
+        st.session_state.pop(f"public_results_snapshot_{wid}", None)
+        st.session_state.pop(f"public_results_token_{wid}", None)
         st.success("Workshop responses cleared. Configuration and breakout groups were retained.")
         st.rerun()
 
@@ -2282,16 +2456,18 @@ def workshop_configuration_view():
 header()
 lead_mode = str(st.query_params.get("lead", "0")) == "1"
 
-nav_options = ["Participant", "Breakout lead", "Facilitator", "Workshop configuration"]
-default_idx = 1 if lead_mode else 0
+nav_options = ["Participant", "Results", "Breakout lead", "Facilitator", "Workshop configuration"]
+default_idx = 2 if lead_mode else 0
 
 mode = st.sidebar.radio("View", nav_options, index=default_idx)
 st.sidebar.markdown("---")
-st.sidebar.caption("WBCSD · CDR Decision Lab · Version 1.1.1")
-st.sidebar.caption("Breakout lead and facilitator/admin areas are protected by separate PINs.")
+st.sidebar.caption("WBCSD · CDR Decision Lab · Version 1.1.2")
+st.sidebar.caption("Participant and Results are public. Breakout lead and facilitator/admin areas use separate PINs.")
 
 if mode == "Participant":
     participant_view()
+elif mode == "Results":
+    results_view()
 elif mode == "Breakout lead":
     breakout_lead_view()
 elif mode == "Facilitator":

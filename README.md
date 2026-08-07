@@ -1,3 +1,31 @@
+# V1.1.2 active-workshop and public-results release
+
+## Participant workshop control
+- Participants can only submit to the workshop currently marked Active by the facilitator.
+- The active workshop name is displayed in a disabled/greyed-out field rather than a selectable dropdown.
+- Submission performs a fresh active-workshop check before writing, so an old browser session cannot write to a workshop that has since been deactivated.
+
+## Public Results view
+- Added a password-free **Results** view for all participants.
+- Removed the show/hide/reveal-results workflow.
+- Results mirrors only the facilitator's **Breakout comparison** content:
+  - every breakout: participant low-average-high range vs coordinated decision
+  - final coordinated allocation comparison
+  - priority heat maps
+  - agreement/disagreement heat maps
+  - compare one barrier across breakouts
+- It excludes Live overview, Qualitative intelligence, and Report & export.
+
+## Publishing refreshed results
+- Facilitator **Refresh results** still fetches a fresh facilitator snapshot.
+- The same click now updates a lightweight database timestamp.
+- Public Results views poll only that timestamp every five seconds; full result tables are reloaded only when the facilitator has published a new refresh.
+- Participant allocation pages remain local and do not poll results while people are entering data.
+
+## Submission controls
+- Lock/Reopen submissions remains available.
+- Show/Hide/Reveal results controls have been removed because Results is now a permanent public view.
+
 # V1.1.1 performance release
 
 ## Participant performance

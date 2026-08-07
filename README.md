@@ -1,3 +1,17 @@
+# V1.1.4 navigation styling update
+
+Sidebar order is now:
+1. Participant
+2. Breakout lead
+3. Results
+4. Facilitator
+5. Workshop configuration
+
+WBCSD visual hierarchy:
+- Participant and Breakout lead: Charcoal
+- Results: WBCSD Orange
+- Facilitator and Workshop configuration: WBCSD Spruce
+
 # V1.1.3 workshop lifecycle / active-workshop release
 
 ## One active workshop is now the single source of truth

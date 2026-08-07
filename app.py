@@ -63,6 +63,21 @@ st.markdown(
     html, body, [class*="css"] {{font-family: Arial, sans-serif; color:{COLORS['charcoal']};}}
     .block-container {{padding-top: 1.0rem; padding-bottom: 3rem; max-width: 1500px;}}
     section[data-testid="stSidebar"] {{background:{COLORS['pearl']}; border-right:1px solid {COLORS['sand']};}}
+    /* Sidebar view hierarchy */
+    section[data-testid="stSidebar"] div[role="radiogroup"] > label:nth-child(1) p,
+    section[data-testid="stSidebar"] div[role="radiogroup"] > label:nth-child(2) p {{
+        color:{COLORS['charcoal']} !important;
+        font-weight:600;
+    }}
+    section[data-testid="stSidebar"] div[role="radiogroup"] > label:nth-child(3) p {{
+        color:{COLORS['orange']} !important;
+        font-weight:700;
+    }}
+    section[data-testid="stSidebar"] div[role="radiogroup"] > label:nth-child(4) p,
+    section[data-testid="stSidebar"] div[role="radiogroup"] > label:nth-child(5) p {{
+        color:{COLORS['spruce']} !important;
+        font-weight:700;
+    }}
     .hero {{border-top:9px solid {COLORS['orange']}; background:{COLORS['charcoal']}; color:white;
             padding:1.35rem 1.5rem 1.2rem; border-radius:0 0 16px 16px; margin-bottom:1.4rem;}}
     .hero h1 {{font-size:2.0rem; margin:0 0 .35rem 0; font-weight:500; letter-spacing:-.03em;}}
@@ -2741,20 +2756,20 @@ def workshop_configuration_view():
 header()
 lead_mode = str(st.query_params.get("lead", "0")) == "1"
 
-nav_options = ["Participant", "Results", "Breakout lead", "Facilitator", "Workshop configuration"]
-default_idx = 2 if lead_mode else 0
+nav_options = ["Participant", "Breakout lead", "Results", "Facilitator", "Workshop configuration"]
+default_idx = 1 if lead_mode else 0
 
 mode = st.sidebar.radio("View", nav_options, index=default_idx)
 st.sidebar.markdown("---")
-st.sidebar.caption("WBCSD · CDR Decision Lab · Version 1.1.3")
+st.sidebar.caption("WBCSD · CDR Decision Lab · Version 1.1.4")
 st.sidebar.caption("Participant and Results are public. Breakout lead and facilitator/admin areas use separate PINs.")
 
 if mode == "Participant":
     participant_view()
-elif mode == "Results":
-    results_view()
 elif mode == "Breakout lead":
     breakout_lead_view()
+elif mode == "Results":
+    results_view()
 elif mode == "Facilitator":
     facilitator_view()
 else:

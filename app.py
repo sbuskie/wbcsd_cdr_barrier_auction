@@ -138,15 +138,36 @@ def get_secret(name, fallback=None):
     return value or os.getenv(name) or fallback
 
 DATABASE_URL = get_secret("DATABASE_URL", "sqlite:///cdr_barrier_auction.db")
-connect_args = {"check_same_thread": False, "timeout": 30} if DATABASE_URL.startswith("sqlite") else {}
-engine = create_engine(DATABASE_URL, pool_pre_ping=True, connect_args=connect_args)
+
+
+@st.cache_resource(show_spinner=False)
+def get_engine(database_url):
+    """Create one SQLAlchemy engine/pool per Streamlit worker process."""
+    if database_url.startswith("sqlite"):
+        return create_engine(
+            database_url,
+            pool_pre_ping=True,
+            connect_args={"check_same_thread": False, "timeout": 30},
+        )
+    return create_engine(
+        database_url,
+        pool_pre_ping=True,
+        pool_size=5,
+        max_overflow=10,
+        pool_recycle=300,
+    )
+
+
+engine = get_engine(DATABASE_URL)
 
 
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
+@st.cache_resource(show_spinner=False)
 def init_db():
+    """Initialise/migrate the schema once per Streamlit worker process."""
     with engine.begin() as conn:
         if DATABASE_URL.startswith("sqlite"):
             conn.execute(text("PRAGMA journal_mode=WAL;"))
@@ -306,6 +327,22 @@ def load_breakouts(workshop_id=None):
     return pd.read_sql("SELECT * FROM workshop_breakouts ORDER BY workshop_id, breakout_code", engine)
 
 
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_workshops_cached():
+    return load_workshops()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_breakouts_cached(workshop_id):
+    return load_breakouts(workshop_id)
+
+
+def clear_configuration_cache():
+    load_workshops_cached.clear()
+    load_breakouts_cached.clear()
+
+
 def load_participants(workshop_id=None):
     if workshop_id:
         return pd.read_sql(
@@ -333,6 +370,7 @@ def database_backend_label():
     return "PostgreSQL"
 
 
+@st.cache_data(ttl=60, show_spinner=False)
 def database_health():
     try:
         with engine.connect() as conn:
@@ -1336,22 +1374,27 @@ def select_workshop(label="Workshop", key="workshop_select"):
 # -----------------------------------------------------------------------------
 @st.fragment(run_every="3s")
 def participant_reveal_fragment(workshop_id, breakout_code):
+    """
+    This is the only participant-side polling.
+    It runs only after a response has been submitted, so allocation inputs never
+    trigger Supabase reads while the participant is deciding.
+    """
     state = load_workshop_state(workshop_id)
     if not bool(state["results_revealed"]):
-        st.markdown('<div class="waiting-box"><b>Response received.</b> Results are hidden until the facilitator triggers the live reveal.</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="waiting-box"><b>Response received.</b> Results are hidden until the facilitator triggers the live reveal.</div>',
+            unsafe_allow_html=True,
+        )
         return
-    group = load_participants(workshop_id)
-    group = group[group["breakout_code"] == breakout_code]
-    if group.empty:
-        return
+
+    participants = load_participants(workshop_id)
+    consensus = load_consensus(workshop_id)
+    breakouts = load_breakouts_cached(workshop_id)
+
     st.markdown(
         '<div class="reveal"><div class="callout"><b>Results revealed</b> - compare how each breakout thought about the barriers and the coordinated decisions they ultimately made.</div></div>',
         unsafe_allow_html=True,
     )
-
-    participants = load_participants(workshop_id)
-    consensus = load_consensus(workshop_id)
-    breakouts = load_breakouts(workshop_id)
 
     st.markdown("### Every breakout · participant range vs coordinated decision")
     st.caption(
@@ -1376,28 +1419,20 @@ def participant_reveal_fragment(workshop_id, breakout_code):
 
         with st.expander(label, expanded=False):
             left, right = st.columns(2)
-
             with left:
                 st.plotly_chart(
                     range_plot_with_consensus(
-                        group_df,
-                        INTERNAL_DB,
-                        "Internal barriers",
-                        COLORS["orange"],
-                        consensus_row,
+                        group_df, INTERNAL_DB, "Internal barriers",
+                        COLORS["orange"], consensus_row,
                     ),
                     use_container_width=True,
                     key=f"reveal_range_int_{workshop_id}_{code}",
                 )
-
             with right:
                 st.plotly_chart(
                     range_plot_with_consensus(
-                        group_df,
-                        EXTERNAL_DB,
-                        "External enabling environment",
-                        COLORS["spruce"],
-                        consensus_row,
+                        group_df, EXTERNAL_DB, "External enabling environment",
+                        COLORS["spruce"], consensus_row,
                     ),
                     use_container_width=True,
                     key=f"reveal_range_ext_{workshop_id}_{code}",
@@ -1417,12 +1452,9 @@ def participant_reveal_fragment(workshop_id, breakout_code):
         st.info("No breakout coordinated allocations have been submitted yet.")
     else:
         left, right = st.columns(2)
-
         with left:
             fig = consensus_comparison_chart(
-                consensus,
-                INTERNAL_DB,
-                "Internal budget · breakout comparison",
+                consensus, INTERNAL_DB, "Internal budget · breakout comparison"
             )
             if fig is not None:
                 st.plotly_chart(
@@ -1430,12 +1462,9 @@ def participant_reveal_fragment(workshop_id, breakout_code):
                     use_container_width=True,
                     key=f"reveal_consensus_internal_{workshop_id}",
                 )
-
         with right:
             fig = consensus_comparison_chart(
-                consensus,
-                EXTERNAL_DB,
-                "External enabling priorities · breakout comparison",
+                consensus, EXTERNAL_DB, "External enabling priorities · breakout comparison"
             )
             if fig is not None:
                 st.plotly_chart(
@@ -1444,62 +1473,44 @@ def participant_reveal_fragment(workshop_id, breakout_code):
                     key=f"reveal_consensus_external_{workshop_id}",
                 )
 
-def participant_view():
-    st.markdown('<div class="section-label">01 · Individual perspective</div>', unsafe_allow_html=True)
-    st.subheader("Where would you allocate scarce attention and resources?")
 
-    workshops = load_workshops()
-    if workshops.empty:
-        st.warning("No workshop has been configured yet.")
-        return
+@st.fragment
+def participant_input_fragment(wid, breakouts, default_breakout_index):
+    """
+    Entire participant data-entry experience runs locally in a Streamlit fragment.
+    Number inputs, +/-5 buttons, profile fields and text edits do not rerun the
+    outer app and therefore do not read from Supabase.
 
-    preset_workshop = st.query_params.get("workshop", "")
-    preset_breakout = st.query_params.get("group", "").upper()
-    active = active_workshop()
-    workshop_options = workshops["workshop_id"].tolist()
-    default_wid = preset_workshop if preset_workshop in workshop_options else (active["workshop_id"] if active else workshop_options[0])
-    wid = st.selectbox(
-        "Workshop", workshop_options, index=workshop_options.index(default_wid),
-        format_func=lambda x: workshops.loc[workshops["workshop_id"] == x, "workshop_name"].iloc[0],
-        key="participant_workshop",
-    )
-    state = load_workshop_state(wid)
-    breakouts = load_breakouts(wid)
-    if breakouts.empty:
-        st.warning("This workshop has no breakout groups configured.")
-        return
-
+    The database is touched only when Submit my allocation is clicked:
+      1. one lock-state check
+      2. one INSERT
+    """
     breakout_codes = breakouts["breakout_code"].tolist()
-    default_breakout_index = breakout_codes.index(preset_breakout) if preset_breakout in breakout_codes else 0
-
-    submitted_key = f"submitted_{wid}"
-    if st.session_state.get(submitted_key):
-        breakout_code = st.session_state.get(f"submitted_breakout_{wid}")
-        participant_reveal_fragment(wid, breakout_code)
-        if st.button("Submit another test response", help="Useful during testing; remove this option for a production event if desired."):
-            st.session_state[submitted_key] = False
-            st.rerun()
-        return
-
-    if bool(state["submissions_locked"]):
-        st.markdown('<div class="locked-box"><b>Submissions are currently locked.</b> The facilitator has closed the individual allocation stage.</div>', unsafe_allow_html=True)
-        if bool(state["results_revealed"]):
-            participant_reveal_fragment(wid, breakout_codes[default_breakout_index])
-        return
 
     with st.expander("About you", expanded=True):
         a, b, c = st.columns(3)
         with a:
-            participant_name = st.text_input("Name (optional)")
-            company = st.text_input("Company")
+            participant_name = st.text_input("Name (optional)", key=f"p_name_{wid}")
+            company = st.text_input("Company", key=f"p_company_{wid}")
         with b:
-            function_name = st.selectbox("Function", FUNCTIONS)
-            sector = st.text_input("Sector")
+            function_name = st.selectbox("Function", FUNCTIONS, key=f"p_function_{wid}")
+            sector = st.text_input("Sector", key=f"p_sector_{wid}")
         with c:
-            cdr_maturity = st.selectbox("CDR maturity", MATURITY)
+            cdr_maturity = st.selectbox("CDR maturity", MATURITY, key=f"p_maturity_{wid}")
             breakout_code = st.selectbox(
-                "Breakout", breakout_codes, index=default_breakout_index,
-                format_func=lambda code: (f"{code} · " + str(breakouts.loc[breakouts['breakout_code'] == code, 'breakout_name'].iloc[0] or "")).rstrip(" ·"),
+                "Breakout",
+                breakout_codes,
+                index=default_breakout_index,
+                format_func=lambda code: (
+                    f"{code} · " +
+                    str(
+                        breakouts.loc[
+                            breakouts["breakout_code"] == code,
+                            "breakout_name"
+                        ].iloc[0] or ""
+                    )
+                ).rstrip(" ·"),
+                key=f"p_breakout_{wid}",
             )
 
     st.markdown("### Internal investment · 100 units")
@@ -1519,7 +1530,9 @@ def participant_view():
     st.markdown("---")
     biggest_reason = st.text_area(
         "What is the single biggest reason your organisation is not moving faster on CDR today?",
-        max_chars=300, placeholder="One concise sentence...",
+        max_chars=300,
+        placeholder="One concise sentence...",
+        key=f"p_reason_{wid}",
     )
 
     profile_ready = bool(company.strip()) and bool(sector.strip())
@@ -1531,17 +1544,30 @@ def participant_view():
     if not allocations_ready:
         st.caption("Complete both 100-unit allocations before submitting.")
 
-    if st.button("Submit my allocation", type="primary", disabled=not ready, use_container_width=True):
-        # Re-check lock at transaction time.
+    if st.button(
+        "Submit my allocation",
+        type="primary",
+        disabled=not ready,
+        use_container_width=True,
+        key=f"p_submit_{wid}",
+    ):
+        # First database call since the participant opened the input interface.
         current_state = load_workshop_state(wid)
         if bool(current_state["submissions_locked"]):
             st.error("Submissions were just locked by the facilitator. Your response was not saved.")
             return
+
         submission_id = f"{wid}-{breakout_code}-{uuid.uuid4().hex[:8].upper()}"
         row = {
-            "submission_id": submission_id, "submitted_at": now_iso(), "workshop_id": wid,
-            "participant_name": participant_name.strip(), "company": company.strip(), "function_name": function_name,
-            "sector": sector.strip(), "cdr_maturity": cdr_maturity, "breakout_code": breakout_code,
+            "submission_id": submission_id,
+            "submitted_at": now_iso(),
+            "workshop_id": wid,
+            "participant_name": participant_name.strip(),
+            "company": company.strip(),
+            "function_name": function_name,
+            "sector": sector.strip(),
+            "cdr_maturity": cdr_maturity,
+            "breakout_code": breakout_code,
             "internal_leadership": internal_values["Leadership buy-in"],
             "internal_governance": internal_values["Governance & decision-making"],
             "internal_budget": internal_values["Budget allocation"],
@@ -1553,8 +1579,10 @@ def participant_view():
             "external_quality": external_values["Credit quality & integrity"],
             "external_demand": external_values["Customer demand"],
             "external_reputation": external_values["Reputation / greenwashing risk"],
-            "external_other": external_values["Other"], "biggest_reason": biggest_reason.strip(),
+            "external_other": external_values["Other"],
+            "biggest_reason": biggest_reason.strip(),
         }
+
         with engine.begin() as conn:
             conn.execute(text("""
                 INSERT INTO participant_submissions (
@@ -1569,9 +1597,89 @@ def participant_view():
                     :external_quality, :external_demand, :external_reputation, :external_other, :biggest_reason
                 )
             """), row)
-        st.session_state[submitted_key] = True
+
+        st.session_state[f"submitted_{wid}"] = True
         st.session_state[f"submitted_breakout_{wid}"] = breakout_code
-        st.rerun()
+        st.rerun(scope="app")
+
+
+def participant_view():
+    st.markdown('<div class="section-label">01 · Individual perspective</div>', unsafe_allow_html=True)
+    st.subheader("Where would you allocate scarce attention and resources?")
+
+    # Slow-changing configuration is cached for five minutes.
+    workshops = load_workshops_cached()
+    if workshops.empty:
+        st.warning("No workshop has been configured yet.")
+        return
+
+    preset_workshop = st.query_params.get("workshop", "")
+    preset_breakout = st.query_params.get("group", "").upper()
+
+    active_rows = workshops[workshops["is_active"] == 1]
+    active = None if active_rows.empty else active_rows.iloc[0].to_dict()
+
+    workshop_options = workshops["workshop_id"].tolist()
+    default_wid = (
+        preset_workshop
+        if preset_workshop in workshop_options
+        else (active["workshop_id"] if active else workshop_options[0])
+    )
+
+    wid = st.selectbox(
+        "Workshop",
+        workshop_options,
+        index=workshop_options.index(default_wid),
+        format_func=lambda x: workshops.loc[
+            workshops["workshop_id"] == x, "workshop_name"
+        ].iloc[0],
+        key="participant_workshop",
+    )
+
+    breakouts = load_breakouts_cached(wid)
+    if breakouts.empty:
+        st.warning("This workshop has no breakout groups configured.")
+        return
+
+    breakout_codes = breakouts["breakout_code"].tolist()
+    default_breakout_index = (
+        breakout_codes.index(preset_breakout)
+        if preset_breakout in breakout_codes
+        else 0
+    )
+
+    submitted_key = f"submitted_{wid}"
+    if st.session_state.get(submitted_key):
+        breakout_code = st.session_state.get(f"submitted_breakout_{wid}")
+        participant_reveal_fragment(wid, breakout_code)
+        if st.button(
+            "Submit another test response",
+            help="Useful during testing; remove this option for a production event if desired.",
+        ):
+            st.session_state[submitted_key] = False
+            st.rerun()
+        return
+
+    # Read workshop state once when this full page is entered. It is deliberately
+    # not re-read while the participant edits allocations. Submit re-checks the
+    # lock directly against the database before writing.
+    participant_state_key = f"participant_initial_state_{wid}"
+    if participant_state_key not in st.session_state:
+        st.session_state[participant_state_key] = load_workshop_state(wid)
+    state = st.session_state[participant_state_key]
+
+    if bool(state["submissions_locked"]):
+        st.markdown(
+            '<div class="locked-box"><b>Submissions are currently locked.</b> '
+            'The facilitator has closed the individual allocation stage.</div>',
+            unsafe_allow_html=True,
+        )
+        if bool(state["results_revealed"]):
+            participant_reveal_fragment(wid, breakout_codes[default_breakout_index])
+        return
+
+    participant_input_fragment(wid, breakouts, default_breakout_index)
+
 
 # -----------------------------------------------------------------------------
 # Breakout lead
@@ -1694,33 +1802,126 @@ def breakout_lead_view():
 # -----------------------------------------------------------------------------
 # Facilitator dashboard
 # -----------------------------------------------------------------------------
+def get_facilitator_snapshot(wid, force=False):
+    """
+    Keep a local session snapshot of workshop results.
+    Database reads happen once on entry and only again when the facilitator
+    explicitly presses Refresh results.
+    """
+    key = f"fac_snapshot_{wid}"
+    if force or key not in st.session_state:
+        participants = load_participants(wid)
+        consensus = load_consensus(wid)
+        workshops = load_workshops_cached()
+        breakouts = load_breakouts_cached(wid)
+        wdf = workshops[workshops["workshop_id"] == wid]
+        wrow = wdf.iloc[0].to_dict() if not wdf.empty else {}
+        status_df = build_submission_status(
+            breakouts,
+            participants,
+            consensus,
+            int(wrow.get("participant_target") or 0),
+        )
+        st.session_state[key] = {
+            "participants": participants,
+            "consensus": consensus,
+            "breakouts": breakouts,
+            "wrow": wrow,
+            "status_df": status_df,
+            "refreshed_at": datetime.now().strftime("%H:%M:%S"),
+        }
+    return st.session_state[key]
+
+
+def build_submission_status(breakouts, participants, consensus, participant_target):
+    breakout_count = max(len(breakouts), 1)
+    expected_per_breakout = (
+        int(round(participant_target / breakout_count))
+        if participant_target else None
+    )
+
+    rows = []
+    for _, br in breakouts.iterrows():
+        code = br["breakout_code"]
+        submitted = (
+            int((participants["breakout_code"] == code).sum())
+            if not participants.empty else 0
+        )
+        consensus_done = (
+            bool((consensus["breakout_code"] == code).any())
+            if not consensus.empty else False
+        )
+        rows.append({
+            "Breakout": code,
+            "Name": br.get("breakout_name") or "",
+            "Expected": (
+                expected_per_breakout
+                if expected_per_breakout is not None else ""
+            ),
+            "Submitted": submitted,
+            "Consensus": "Complete" if consensus_done else "Pending",
+            "Ready": (
+                "Yes"
+                if consensus_done and (
+                    expected_per_breakout is None
+                    or submitted >= expected_per_breakout
+                )
+                else "No"
+            ),
+        })
+    return pd.DataFrame(rows)
+
+
+def get_facilitator_state(wid):
+    key = f"fac_state_{wid}"
+    if key not in st.session_state:
+        st.session_state[key] = load_workshop_state(wid)
+    return st.session_state[key]
+
+
 def live_controls(wid):
-    state = load_workshop_state(wid)
+    state = get_facilitator_state(wid)
     st.markdown("### Live workshop controls")
     c1, c2, c3 = st.columns([1.3, 1.3, 2.4])
+
     with c1:
         if bool(state["submissions_locked"]):
             if st.button("Reopen submissions", use_container_width=True):
                 update_workshop_state(wid, locked=0)
+                state["submissions_locked"] = 0
+                st.session_state[f"fac_state_{wid}"] = state
                 st.rerun()
         else:
             if st.button("Lock submissions", type="primary", use_container_width=True):
                 update_workshop_state(wid, locked=1)
+                state["submissions_locked"] = 1
+                st.session_state[f"fac_state_{wid}"] = state
                 st.rerun()
+
     with c2:
         if bool(state["results_revealed"]):
             if st.button("Hide results", use_container_width=True):
                 update_workshop_state(wid, revealed=0)
+                state["results_revealed"] = 0
+                st.session_state[f"fac_state_{wid}"] = state
                 st.rerun()
         else:
             if st.button("Reveal results", type="primary", use_container_width=True):
                 update_workshop_state(wid, revealed=1)
+                state["results_revealed"] = 1
+                st.session_state[f"fac_state_{wid}"] = state
                 st.rerun()
+
     with c3:
-        status = []
-        status.append("Submissions locked" if state["submissions_locked"] else "Submissions open")
-        status.append("Results visible to participants" if state["results_revealed"] else "Results hidden")
-        st.markdown(f'<div class="callout"><b>Stage:</b> {" · ".join(status)}</div>', unsafe_allow_html=True)
+        status = [
+            "Submissions locked" if state["submissions_locked"] else "Submissions open",
+            "Results visible to participants" if state["results_revealed"] else "Results hidden",
+        ]
+        st.markdown(
+            f'<div class="callout"><b>Stage:</b> {" · ".join(status)}</div>',
+            unsafe_allow_html=True,
+        )
+    return state
 
 
 def facilitator_view():
@@ -1733,21 +1934,32 @@ def facilitator_view():
         return
     live_controls(wid)
 
-    participants = load_participants(wid)
-    consensus = load_consensus(wid)
+    refresh_col, info_col = st.columns([1.2, 3.8])
+    with refresh_col:
+        refresh_clicked = st.button(
+            "Refresh results",
+            type="primary",
+            use_container_width=True,
+            help="Fetch the latest participant submissions and breakout decisions from the database.",
+        )
+
+    snapshot = get_facilitator_snapshot(wid, force=refresh_clicked)
+    participants = snapshot["participants"]
+    consensus = snapshot["consensus"]
+    breakouts = snapshot["breakouts"]
+    wrow = snapshot["wrow"]
+    status_df = snapshot["status_df"]
+
+    with info_col:
+        st.markdown(
+            f'<div class="callout"><b>Results snapshot:</b> refreshed at '
+            f'{snapshot["refreshed_at"]} · {database_backend_label()}</div>',
+            unsafe_allow_html=True,
+        )
 
     st.markdown("### Submission status")
-    status_df = workshop_submission_status(wid)
     if not status_df.empty:
         st.dataframe(status_df, hide_index=True, use_container_width=True)
-    st.caption(
-        f"Database: {database_backend_label()} · "
-        f"{'connected' if database_health() else 'connection problem'}"
-    )
-
-    workshops = load_workshops()
-    wrow = workshops[workshops["workshop_id"] == wid].iloc[0].to_dict()
-    breakouts = load_breakouts(wid)
     if participants.empty:
         st.warning("No participant submissions yet.")
         return
@@ -1969,6 +2181,7 @@ def workshop_configuration_view():
                                     (workshop_id, breakout_code, breakout_name)
                                 VALUES (:wid,:code,:name)
                             """), {"wid":wid,"code":code,"name":f"Breakout {i}"})
+                    clear_configuration_cache()
                     st.success("Workshop created.")
                     st.rerun()
                 except Exception as exc:
@@ -1993,6 +2206,7 @@ def workshop_configuration_view():
         with engine.begin() as conn:
             conn.execute(text("UPDATE workshops SET is_active=0"))
             conn.execute(text("UPDATE workshops SET is_active=1 WHERE workshop_id=:wid"), {"wid":wid})
+        clear_configuration_cache()
         st.rerun()
 
     st.markdown("### Breakout groups")
@@ -2013,6 +2227,7 @@ def workshop_configuration_view():
                 conn.execute(text("DELETE FROM workshop_breakouts WHERE workshop_id=:wid"), {"wid":wid})
                 for _, br in clean.iterrows():
                     conn.execute(text("INSERT INTO workshop_breakouts (workshop_id, breakout_code, breakout_name) VALUES (:wid,:code,:name)"), {"wid":wid,"code":br["breakout_code"],"name":br["breakout_name"]})
+            clear_configuration_cache()
             st.success("Breakouts saved.")
             st.rerun()
 
@@ -2043,6 +2258,8 @@ def workshop_configuration_view():
     ):
         reset_workshop_responses(wid)
         st.session_state[f"reset_confirm_{wid}"] = ""
+        st.session_state.pop(f"fac_snapshot_{wid}", None)
+        st.session_state.pop(f"fac_state_{wid}", None)
         st.success("Workshop responses cleared. Configuration and breakout groups were retained.")
         st.rerun()
 
@@ -2070,7 +2287,7 @@ default_idx = 1 if lead_mode else 0
 
 mode = st.sidebar.radio("View", nav_options, index=default_idx)
 st.sidebar.markdown("---")
-st.sidebar.caption("WBCSD · CDR Decision Lab · Version 1.1.0")
+st.sidebar.caption("WBCSD · CDR Decision Lab · Version 1.1.1")
 st.sidebar.caption("Breakout lead and facilitator/admin areas are protected by separate PINs.")
 
 if mode == "Participant":

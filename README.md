@@ -1,3 +1,30 @@
+# V1.1.1 performance release
+
+## Participant performance
+The participant data-entry area now runs inside a Streamlit fragment. Editing profile fields, typing values, or pressing -5/+5 reruns only that local fragment and does not reload workshop data from Supabase.
+
+Participant database traffic is now:
+1. Initial page/configuration load.
+2. On **Submit my allocation**: one lock-state check and one INSERT.
+3. After submission only: the existing reveal fragment polls the small workshop-state record until the facilitator reveals results.
+
+## Connection pooling and startup
+- The SQLAlchemy engine is cached as a Streamlit resource so reruns reuse the same connection pool.
+- Database schema initialization/migrations run once per worker process rather than on every widget interaction.
+- PostgreSQL/Supabase uses a small reusable SQLAlchemy connection pool.
+
+## Cached configuration
+Workshop and breakout configuration are cached for five minutes. Admin writes explicitly clear this cache.
+
+## Facilitator refresh
+The facilitator dashboard no longer fetches all participant/results data on every Streamlit interaction.
+- Results are loaded once when the facilitator opens a workshop.
+- **Refresh results** explicitly fetches the latest participant submissions and breakout consensus from Supabase.
+- Filters, tabs, chart selections and other dashboard interactions operate against the local snapshot.
+- The dashboard shows the timestamp of the current results snapshot.
+
+Live controls (lock/reopen and reveal/hide) still write immediately to the database when clicked.
+
 # V1.1.0 Supabase and workshop operations
 
 ## Supabase/PostgreSQL fix

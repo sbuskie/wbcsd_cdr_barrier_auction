@@ -458,85 +458,104 @@ def make_wordcloud(texts):
     return wc.to_array()
 
 # -----------------------------------------------------------------------------
-# Allocation UI - exact 100 with automatic proportional rebalancing
+# Allocation UI - deliberate manual allocation, exact total required
 # -----------------------------------------------------------------------------
 def alloc_key(prefix, idx):
     return f"{prefix}__{idx}"
 
 
 def init_allocation(prefix, labels):
-    if all(alloc_key(prefix, i) in st.session_state for i in range(len(labels))):
-        return
-    base = 100 // len(labels)
-    rem = 100 - base * len(labels)
+    """Start each allocation at zero and preserve every choice the user makes."""
     for i in range(len(labels)):
-        st.session_state[alloc_key(prefix, i)] = base + (1 if i < rem else 0)
-
-
-def proportional_distribution(weights, total):
-    if not weights:
-        return []
-    if total <= 0:
-        return [0] * len(weights)
-    positive_sum = sum(max(0, w) for w in weights)
-    if positive_sum == 0:
-        raw = [total / len(weights)] * len(weights)
-    else:
-        raw = [total * max(0, w) / positive_sum for w in weights]
-    floor_vals = [int(math.floor(x)) for x in raw]
-    remainder = total - sum(floor_vals)
-    order = sorted(range(len(raw)), key=lambda i: raw[i] - floor_vals[i], reverse=True)
-    for i in order[:remainder]:
-        floor_vals[i] += 1
-    return floor_vals
-
-
-def rebalance_allocation(prefix, labels, changed_idx):
-    changed_key = alloc_key(prefix, changed_idx)
-    changed = int(max(0, min(100, st.session_state.get(changed_key, 0))))
-    st.session_state[changed_key] = changed
-    remaining = 100 - changed
-    other_indices = [i for i in range(len(labels)) if i != changed_idx]
-    weights = [int(st.session_state.get(alloc_key(prefix, i), 0)) for i in other_indices]
-    distributed = proportional_distribution(weights, remaining)
-    for i, value in zip(other_indices, distributed):
-        st.session_state[alloc_key(prefix, i)] = int(value)
+        key = alloc_key(prefix, i)
+        if key not in st.session_state:
+            st.session_state[key] = 0
 
 
 def nudge_allocation(prefix, labels, idx, delta):
+    """Adjust only the selected barrier. Never rebalance other choices."""
     key = alloc_key(prefix, idx)
-    st.session_state[key] = int(max(0, min(100, st.session_state.get(key, 0) + delta)))
-    rebalance_allocation(prefix, labels, idx)
+    current = int(st.session_state.get(key, 0))
+    st.session_state[key] = int(max(0, min(100, current + delta)))
 
 
 def allocation_editor(prefix, labels, help_text=None):
     init_allocation(prefix, labels)
+
     if help_text:
         st.caption(help_text)
-    st.caption("Change any value and the remaining units are rebalanced proportionally. Use +/-5 for quick adjustments.")
+
+    st.caption(
+        "Allocate the 100 units deliberately. Changing one barrier will not alter any of your other choices. "
+        "Use −5 / +5 for quick adjustments or type an exact value."
+    )
+
     for i, label in enumerate(labels):
-        c_label, c_minus, c_value, c_plus = st.columns([5.2, 0.8, 1.25, 0.8], vertical_alignment="center")
+        c_label, c_minus, c_value, c_plus = st.columns(
+            [5.2, 0.8, 1.25, 0.8],
+            vertical_alignment="center",
+        )
         value = int(st.session_state[alloc_key(prefix, i)])
+
         with c_label:
             st.markdown(
                 f'<div class="allocation-row"><div class="allocation-label">{label}</div>'
                 f'<div class="alloc-track"><div class="alloc-fill" style="width:{value}%"></div></div></div>',
                 unsafe_allow_html=True,
             )
+
         with c_minus:
-            st.button("−5", key=f"{prefix}_minus_{i}", on_click=nudge_allocation, args=(prefix, labels, i, -5), use_container_width=True)
+            st.button(
+                "−5",
+                key=f"{prefix}_minus_{i}",
+                on_click=nudge_allocation,
+                args=(prefix, labels, i, -5),
+                use_container_width=True,
+            )
+
         with c_value:
             st.number_input(
-                label, min_value=0, max_value=100, step=1,
-                key=alloc_key(prefix, i), label_visibility="collapsed",
-                on_change=rebalance_allocation, args=(prefix, labels, i),
+                label,
+                min_value=0,
+                max_value=100,
+                step=1,
+                key=alloc_key(prefix, i),
+                label_visibility="collapsed",
             )
+
         with c_plus:
-            st.button("+5", key=f"{prefix}_plus_{i}", on_click=nudge_allocation, args=(prefix, labels, i, 5), use_container_width=True)
-    values = {label: int(st.session_state[alloc_key(prefix, i)]) for i, label in enumerate(labels)}
+            st.button(
+                "+5",
+                key=f"{prefix}_plus_{i}",
+                on_click=nudge_allocation,
+                args=(prefix, labels, i, 5),
+                use_container_width=True,
+            )
+
+    values = {
+        label: int(st.session_state[alloc_key(prefix, i)])
+        for i, label in enumerate(labels)
+    }
     total = sum(values.values())
-    st.markdown(f'<span class="total-pill">Total {total} / 100</span>', unsafe_allow_html=True)
-    return values
+    remaining = 100 - total
+
+    if total == 100:
+        st.markdown(
+            '<div class="ok"><b>100 / 100 allocated</b> · complete</div>',
+            unsafe_allow_html=True,
+        )
+    elif total < 100:
+        st.markdown(
+            f'<div class="warn"><b>{total} / 100 allocated</b> · {remaining} units remaining</div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            f'<div class="bad"><b>{total} / 100 allocated</b> · {-remaining} units over the limit</div>',
+            unsafe_allow_html=True,
+        )
+
+    return values, total
 
 # -----------------------------------------------------------------------------
 # PDF generation
@@ -783,21 +802,34 @@ def participant_view():
                 format_func=lambda code: (f"{code} · " + str(breakouts.loc[breakouts['breakout_code'] == code, 'breakout_name'].iloc[0] or "")).rstrip(" ·"),
             )
 
-    tab_internal, tab_external = st.tabs(["Internal investment · 100 units", "External enabling environment · 100 units"])
-    with tab_internal:
-        st.write("Prioritise barriers your company can directly address through budget, capability and internal decision-making.")
-        internal_values = allocation_editor(f"p_int_{wid}", INTERNAL)
-    with tab_external:
-        st.write("Prioritise external conditions that need progress through advocacy, standards, market development or collective action.")
-        external_values = allocation_editor(f"p_ext_{wid}", EXTERNAL)
+    st.markdown("### Internal investment · 100 units")
+    st.write(
+        "Prioritise barriers your company can directly address through budget, capability and internal decision-making."
+    )
+    internal_values, internal_total = allocation_editor(f"p_int_{wid}", INTERNAL)
 
+    st.markdown("---")
+    st.markdown("### External enabling environment · 100 units")
+    st.write(
+        "Now allocate a separate 100 influence units across external conditions that need progress through "
+        "advocacy, standards, market development or collective action. These are not taken from the internal 100."
+    )
+    external_values, external_total = allocation_editor(f"p_ext_{wid}", EXTERNAL)
+
+    st.markdown("---")
     biggest_reason = st.text_area(
         "What is the single biggest reason your organisation is not moving faster on CDR today?",
         max_chars=300, placeholder="One concise sentence...",
     )
-    ready = bool(company.strip()) and bool(sector.strip())
-    if not ready:
-        st.caption("Company and Sector are required. Both allocations always remain at exactly 100.")
+
+    profile_ready = bool(company.strip()) and bool(sector.strip())
+    allocations_ready = internal_total == 100 and external_total == 100
+    ready = profile_ready and allocations_ready
+
+    if not profile_ready:
+        st.caption("Company and Sector are required.")
+    if not allocations_ready:
+        st.caption("Complete both 100-unit allocations before submitting.")
 
     if st.button("Submit my allocation", type="primary", disabled=not ready, use_container_width=True):
         # Re-check lock at transaction time.
@@ -883,13 +915,16 @@ def breakout_lead_view():
     st.markdown("### Agree one coordinated allocation")
     ci, ce = st.tabs(["Internal consensus · 100", "External consensus · 100"])
     with ci:
-        internal_values = allocation_editor(f"c_int_{wid}_{breakout_code}", INTERNAL)
+        internal_values, internal_total = allocation_editor(f"c_int_{wid}_{breakout_code}", INTERNAL)
     with ce:
-        external_values = allocation_editor(f"c_ext_{wid}_{breakout_code}", EXTERNAL)
+        external_values, external_total = allocation_editor(f"c_ext_{wid}_{breakout_code}", EXTERNAL)
     rationale = st.text_area("Why did the group make this allocation?", max_chars=900)
     intervention = st.text_area("What one intervention would most help companies progress?", max_chars=450)
 
-    if st.button("Save breakout consensus", type="primary", use_container_width=True):
+    consensus_ready = internal_total == 100 and external_total == 100
+    if not consensus_ready:
+        st.caption("Both consensus allocations must total exactly 100 before saving.")
+    if st.button("Save breakout consensus", type="primary", disabled=not consensus_ready, use_container_width=True):
         row = {
             "workshop_id": wid, "breakout_code": breakout_code, "submitted_at": now_iso(),
             "internal_leadership": internal_values["Leadership buy-in"],
@@ -1195,7 +1230,7 @@ default_idx = 1 if lead_mode else 0
 
 mode = st.sidebar.radio("View", nav_options, index=default_idx)
 st.sidebar.markdown("---")
-st.sidebar.caption("WBCSD · CDR Decision Lab · Version 1.0.1")
+st.sidebar.caption("WBCSD · CDR Decision Lab · Version 1.0.2")
 st.sidebar.caption("Breakout lead and facilitator/admin areas are protected by separate PINs.")
 
 if mode == "Participant":

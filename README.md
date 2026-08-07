@@ -1,3 +1,13 @@
+# V1.0.2 participant UX update
+
+- Participant allocations are sequential again: Internal investment first, then External enabling environment directly below it. There is no tab to miss.
+- Removed proportional rebalancing completely.
+- Editing a barrier changes only that barrier.
+- −5 / +5 controls remain for quick adjustment, alongside exact numeric entry.
+- Allocations start at zero.
+- Participants cannot submit until both the internal and external allocations total exactly 100.
+- Breakout consensus uses the same non-rebalancing allocation behaviour and cannot be saved until both consensus allocations total exactly 100.
+
 # V1.0.1 deployment fix
 
 This patch fixes workshop creation on deployments that retained an older SQLite schema and removes the `?staff=1` navigation gate.

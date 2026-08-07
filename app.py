@@ -464,12 +464,13 @@ def alloc_key(prefix, idx):
     return f"{prefix}__{idx}"
 
 
-def init_allocation(prefix, labels):
-    """Start each allocation at zero and preserve every choice the user makes."""
-    for i in range(len(labels)):
+def init_allocation(prefix, labels, defaults=None):
+    """Initialise once, then preserve every choice the user makes."""
+    defaults = defaults or {}
+    for i, label in enumerate(labels):
         key = alloc_key(prefix, i)
         if key not in st.session_state:
-            st.session_state[key] = 0
+            st.session_state[key] = int(defaults.get(label, 0))
 
 
 def nudge_allocation(prefix, labels, idx, delta):
@@ -479,8 +480,8 @@ def nudge_allocation(prefix, labels, idx, delta):
     st.session_state[key] = int(max(0, min(100, current + delta)))
 
 
-def allocation_editor(prefix, labels, help_text=None):
-    init_allocation(prefix, labels)
+def allocation_editor(prefix, labels, help_text=None, defaults=None):
+    init_allocation(prefix, labels, defaults=defaults)
 
     if help_text:
         st.caption(help_text)
@@ -556,6 +557,96 @@ def allocation_editor(prefix, labels, help_text=None):
         )
 
     return values, total
+
+
+def range_plot_with_consensus(df, mapping, title, color, consensus_row=None):
+    """Low-average-high participant range with optional breakout consensus marker."""
+    base = summary_table(df, mapping).sort_values("Average", ascending=True)
+
+    fig = go.Figure()
+    for _, r in base.iterrows():
+        fig.add_trace(go.Scatter(
+            x=[r["Low"], r["High"]],
+            y=[r["Barrier"], r["Barrier"]],
+            mode="lines",
+            line=dict(color=COLORS["sand"], width=9),
+            showlegend=False,
+            hoverinfo="skip",
+        ))
+
+    fig.add_trace(go.Scatter(
+        x=base["Average"],
+        y=base["Barrier"],
+        mode="markers",
+        marker=dict(size=13, color=color),
+        name="Participant average",
+        customdata=np.stack([base["Low"], base["High"]], axis=-1),
+        hovertemplate="%{y}<br>Average %{x:.1f}<br>Low %{customdata[0]:.1f}<br>High %{customdata[1]:.1f}<extra></extra>",
+    ))
+
+    if consensus_row is not None:
+        consensus_values = []
+        consensus_barriers = []
+        for barrier in base["Barrier"]:
+            db_col = mapping[barrier]
+            value = consensus_row.get(db_col)
+            if value is not None and not pd.isna(value):
+                consensus_barriers.append(barrier)
+                consensus_values.append(float(value))
+        if consensus_values:
+            fig.add_trace(go.Scatter(
+                x=consensus_values,
+                y=consensus_barriers,
+                mode="markers",
+                marker=dict(size=14, color=COLORS["charcoal"], symbol="diamond"),
+                name="Breakout consensus",
+                hovertemplate="%{y}<br>Consensus %{x:.0f}<extra></extra>",
+            ))
+
+    fig.update_layout(
+        title=title,
+        xaxis=dict(range=[0, 100], title="Allocation units"),
+        yaxis_title=None,
+        height=max(330, 58 * len(base) + 100),
+        plot_bgcolor="white",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        margin=dict(l=10, r=20, t=70, b=20),
+    )
+    return fig
+
+
+def consensus_comparison_chart(consensus_df, mapping, title):
+    """100-unit stacked comparison of final coordinated allocations by breakout."""
+    if consensus_df.empty:
+        return None
+
+    rows = []
+    for _, r in consensus_df.sort_values("breakout_code").iterrows():
+        for barrier, col in mapping.items():
+            rows.append({
+                "Breakout": r["breakout_code"],
+                "Barrier": barrier,
+                "Allocation": float(r[col]),
+            })
+
+    long_df = pd.DataFrame(rows)
+    fig = px.bar(
+        long_df,
+        x="Breakout",
+        y="Allocation",
+        color="Barrier",
+        barmode="stack",
+        title=title,
+    )
+    fig.update_layout(
+        yaxis=dict(range=[0, 100], title="Allocation units"),
+        xaxis_title=None,
+        height=430,
+        legend_title_text="Barrier",
+        margin=dict(l=10, r=20, t=60, b=20),
+    )
+    return fig
+
 
 # -----------------------------------------------------------------------------
 # PDF generation
@@ -734,12 +825,49 @@ def participant_reveal_fragment(workshop_id, breakout_code):
     group = group[group["breakout_code"] == breakout_code]
     if group.empty:
         return
-    st.markdown('<div class="reveal"><div class="callout"><b>Results revealed</b> - this view updates as your breakout completes its individual submissions.</div></div>', unsafe_allow_html=True)
+    st.markdown('<div class="reveal"><div class="callout"><b>Results revealed</b> - this view updates as your breakout completes its individual submissions and coordinated decision.</div></div>', unsafe_allow_html=True)
+
+    consensus = load_consensus(workshop_id)
+    cdf = consensus[consensus["breakout_code"] == breakout_code]
+    consensus_row = cdf.iloc[0].to_dict() if not cdf.empty else None
+
     c1, c2 = st.columns(2)
     with c1:
-        st.plotly_chart(range_plot(group, INTERNAL_DB, "Internal barriers · low / average / high", COLORS["orange"]), use_container_width=True, key=f"participant_int_{workshop_id}_{breakout_code}")
+        st.plotly_chart(
+            range_plot_with_consensus(
+                group, INTERNAL_DB,
+                "Internal barriers · low / average / high + breakout decision",
+                COLORS["orange"], consensus_row,
+            ),
+            use_container_width=True,
+            key=f"participant_int_{workshop_id}_{breakout_code}",
+        )
     with c2:
-        st.plotly_chart(range_plot(group, EXTERNAL_DB, "External enabling environment · low / average / high", COLORS["spruce"]), use_container_width=True, key=f"participant_ext_{workshop_id}_{breakout_code}")
+        st.plotly_chart(
+            range_plot_with_consensus(
+                group, EXTERNAL_DB,
+                "External enabling environment · low / average / high + breakout decision",
+                COLORS["spruce"], consensus_row,
+            ),
+            use_container_width=True,
+            key=f"participant_ext_{workshop_id}_{breakout_code}",
+        )
+
+    if consensus_row is None:
+        st.caption("The breakout consensus marker will appear once the breakout lead submits the coordinated allocation.")
+
+    if not consensus.empty:
+        st.markdown("### How the breakouts made their final allocations")
+        st.caption("Each column totals 100 and shows the final coordinated decision submitted by that breakout.")
+        s1, s2 = st.columns(2)
+        with s1:
+            fig = consensus_comparison_chart(consensus, INTERNAL_DB, "Internal budget · breakout comparison")
+            if fig is not None:
+                st.plotly_chart(fig, use_container_width=True, key=f"participant_cons_int_{workshop_id}")
+        with s2:
+            fig = consensus_comparison_chart(consensus, EXTERNAL_DB, "External enabling priorities · breakout comparison")
+            if fig is not None:
+                st.plotly_chart(fig, use_container_width=True, key=f"participant_cons_ext_{workshop_id}")
 
 # -----------------------------------------------------------------------------
 # Participant
@@ -913,13 +1041,47 @@ def breakout_lead_view():
         st.dataframe(summary_table(group, EXTERNAL_DB), hide_index=True, use_container_width=True)
 
     st.markdown("### Agree one coordinated allocation")
-    ci, ce = st.tabs(["Internal consensus · 100", "External consensus · 100"])
-    with ci:
-        internal_values, internal_total = allocation_editor(f"c_int_{wid}_{breakout_code}", INTERNAL)
-    with ce:
-        external_values, external_total = allocation_editor(f"c_ext_{wid}_{breakout_code}", EXTERNAL)
-    rationale = st.text_area("Why did the group make this allocation?", max_chars=900)
-    intervention = st.text_area("What one intervention would most help companies progress?", max_chars=450)
+    st.caption(
+        "Each allocation starts from the rounded average of this breakout's individual responses. "
+        "This is only a starting point: the group should discuss and adjust the values, and both sections "
+        "must total exactly 100 before submission."
+    )
+
+    internal_defaults = {
+        barrier: int(round(float(group[col].mean())))
+        for barrier, col in INTERNAL_DB.items()
+    }
+    external_defaults = {
+        barrier: int(round(float(group[col].mean())))
+        for barrier, col in EXTERNAL_DB.items()
+    }
+
+    st.markdown("#### Internal consensus · 100 units")
+    internal_values, internal_total = allocation_editor(
+        f"c_int_{wid}_{breakout_code}",
+        INTERNAL,
+        defaults=internal_defaults,
+    )
+
+    st.markdown("---")
+    st.markdown("#### External enabling environment consensus · 100 units")
+    external_values, external_total = allocation_editor(
+        f"c_ext_{wid}_{breakout_code}",
+        EXTERNAL,
+        defaults=external_defaults,
+    )
+
+    st.markdown("---")
+    rationale = st.text_area(
+        "Why did the group make this allocation?",
+        max_chars=900,
+        key=f"rationale_{wid}_{breakout_code}",
+    )
+    intervention = st.text_area(
+        "What one intervention would most help companies progress?",
+        max_chars=450,
+        key=f"intervention_{wid}_{breakout_code}",
+    )
 
     consensus_ready = internal_total == 100 and external_total == 100
     if not consensus_ready:
@@ -1023,11 +1185,31 @@ def facilitator_view():
         breakout_options = ["All"] + sorted(participants["breakout_code"].dropna().unique().tolist())
         selected = st.selectbox("View", breakout_options, key="overview_breakout")
         data = participants if selected == "All" else participants[participants["breakout_code"] == selected]
+        selected_consensus_row = None
+        if selected != "All":
+            selected_consensus = consensus[consensus["breakout_code"] == selected]
+            if not selected_consensus.empty:
+                selected_consensus_row = selected_consensus.iloc[0].to_dict()
+
         c1, c2 = st.columns(2)
         with c1:
-            st.plotly_chart(range_plot(data, INTERNAL_DB, "Internal · low / average / high", COLORS["orange"]), use_container_width=True)
+            st.plotly_chart(
+                range_plot_with_consensus(
+                    data, INTERNAL_DB,
+                    "Internal · low / average / high + breakout decision",
+                    COLORS["orange"], selected_consensus_row,
+                ),
+                use_container_width=True,
+            )
         with c2:
-            st.plotly_chart(range_plot(data, EXTERNAL_DB, "External · low / average / high", COLORS["spruce"]), use_container_width=True)
+            st.plotly_chart(
+                range_plot_with_consensus(
+                    data, EXTERNAL_DB,
+                    "External · low / average / high + breakout decision",
+                    COLORS["spruce"], selected_consensus_row,
+                ),
+                use_container_width=True,
+            )
         st.markdown("### Agreement / disagreement")
         combined = pd.concat([
             summary_table(data, INTERNAL_DB).assign(Type="Internal"),
@@ -1036,6 +1218,46 @@ def facilitator_view():
         st.dataframe(combined[["Type", "Barrier", "Low", "Average", "High", "Std dev", "Agreement"]], hide_index=True, use_container_width=True)
 
     with comparisons:
+        st.markdown("### Every breakout · participant range vs coordinated decision")
+        st.caption(
+            "For each breakout, the range is the lowest-to-highest participant response, "
+            "the coloured dot is the participant average, and the charcoal diamond is the final breakout allocation."
+        )
+        for code in breakouts["breakout_code"].tolist():
+            g = participants[participants["breakout_code"] == code]
+            if g.empty:
+                continue
+            cdf = consensus[consensus["breakout_code"] == code]
+            crow = cdf.iloc[0].to_dict() if not cdf.empty else None
+            with st.expander(f"{code} · {len(g)} participant responses", expanded=False):
+                lcol, rcol = st.columns(2)
+                with lcol:
+                    st.plotly_chart(
+                        range_plot_with_consensus(g, INTERNAL_DB, "Internal barriers", COLORS["orange"], crow),
+                        use_container_width=True,
+                        key=f"fac_range_int_{wid}_{code}",
+                    )
+                with rcol:
+                    st.plotly_chart(
+                        range_plot_with_consensus(g, EXTERNAL_DB, "External enabling environment", COLORS["spruce"], crow),
+                        use_container_width=True,
+                        key=f"fac_range_ext_{wid}_{code}",
+                    )
+
+        st.markdown("### Final coordinated allocation · breakout comparison")
+        if consensus.empty:
+            st.info("No breakout coordinated allocations have been submitted yet.")
+        else:
+            lcol, rcol = st.columns(2)
+            with lcol:
+                fig = consensus_comparison_chart(consensus, INTERNAL_DB, "Internal budget allocation by breakout")
+                if fig is not None:
+                    st.plotly_chart(fig, use_container_width=True, key=f"fac_consensus_int_{wid}")
+            with rcol:
+                fig = consensus_comparison_chart(consensus, EXTERNAL_DB, "External enabling priorities by breakout")
+                if fig is not None:
+                    st.plotly_chart(fig, use_container_width=True, key=f"fac_consensus_ext_{wid}")
+
         st.markdown("### Priority heat maps")
         hi, he = st.tabs(["Internal", "External"])
         with hi:
@@ -1230,7 +1452,7 @@ default_idx = 1 if lead_mode else 0
 
 mode = st.sidebar.radio("View", nav_options, index=default_idx)
 st.sidebar.markdown("---")
-st.sidebar.caption("WBCSD · CDR Decision Lab · Version 1.0.2")
+st.sidebar.caption("WBCSD · CDR Decision Lab · Version 1.0.3")
 st.sidebar.caption("Breakout lead and facilitator/admin areas are protected by separate PINs.")
 
 if mode == "Participant":

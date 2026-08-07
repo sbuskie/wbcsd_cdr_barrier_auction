@@ -1,3 +1,13 @@
+# V1.0.3 breakout decision and reveal update
+
+- Breakout lead allocation is now sequential, matching the participant flow: Internal first, External second, then qualitative questions.
+- New breakout allocations are pre-loaded with the rounded participant averages for that breakout. Rounding may leave a total slightly above or below 100, so the group must still make a deliberate final adjustment.
+- Breakout rationale and intervention fields now use workshop-and-breakout-specific state keys. Switching from B1 to B2 therefore shows B2's own blank/input state rather than carrying B1 text across.
+- Revealed participant results overlay the final breakout consensus as a charcoal diamond on the same low-average-high chart.
+- Facilitator breakout views do the same.
+- Facilitator comparison now contains a low-average-high + consensus view for every breakout.
+- Added two whole-workshop stacked comparisons: final internal 100-unit allocation by breakout and final external 100-unit allocation by breakout.
+
 # V1.0.2 participant UX update
 
 - Participant allocations are sequential again: Internal investment first, then External enabling environment directly below it. There is no tab to miss.

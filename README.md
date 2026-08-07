@@ -1,3 +1,16 @@
+# V1.0.1 deployment fix
+
+This patch fixes workshop creation on deployments that retained an older SQLite schema and removes the `?staff=1` navigation gate.
+
+## What changed
+- Facilitator and Workshop configuration are now always visible in the sidebar.
+- Both remain protected by `FACILITATOR_PIN`.
+- Breakout lead remains separately protected by `BREAKOUT_LEAD_PIN`.
+- Added an automatic SQLite migration so breakout codes such as `B1` can be reused across different workshops using the correct composite key `(workshop_id, breakout_code)`.
+- Added a clearer error message if workshop creation still fails.
+
+After pushing this version to GitHub, allow Streamlit to restart once before creating a new workshop.
+
 # WBCSD CDR Decision Lab - Version 1.0
 
 A WBCSD-branded Streamlit workshop application for moving from individual CDR barrier allocations to a coordinated breakout decision.

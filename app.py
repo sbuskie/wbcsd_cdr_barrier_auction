@@ -175,6 +175,38 @@ def init_db():
             results_revealed INTEGER NOT NULL DEFAULT 0,
             updated_at TEXT NOT NULL
         )"""))
+
+        # V1.0.1 migration for older SQLite deployments.
+        # CREATE TABLE IF NOT EXISTS does not alter an existing table, so if an
+        # earlier deployment used breakout_code as the only primary key, B1/B2
+        # can collide when a new workshop is created. Rebuild with the intended
+        # composite primary key: (workshop_id, breakout_code).
+        if DATABASE_URL.startswith("sqlite"):
+            pk_rows = conn.execute(text("PRAGMA table_info(workshop_breakouts)")).fetchall()
+            pk_cols = [row[1] for row in sorted(
+                [r for r in pk_rows if int(r[5] or 0) > 0],
+                key=lambda r: int(r[5])
+            )]
+            if pk_cols != ["workshop_id", "breakout_code"]:
+                conn.execute(text("""
+                    CREATE TABLE workshop_breakouts_v101 (
+                        workshop_id TEXT NOT NULL,
+                        breakout_code TEXT NOT NULL,
+                        breakout_name TEXT,
+                        PRIMARY KEY (workshop_id, breakout_code)
+                    )
+                """))
+                existing_cols = {r[1] for r in pk_rows}
+                if {"workshop_id", "breakout_code"}.issubset(existing_cols):
+                    conn.execute(text("""
+                        INSERT OR IGNORE INTO workshop_breakouts_v101
+                            (workshop_id, breakout_code, breakout_name)
+                        SELECT workshop_id, breakout_code, breakout_name
+                        FROM workshop_breakouts
+                        WHERE workshop_id IS NOT NULL AND breakout_code IS NOT NULL
+                    """))
+                conn.execute(text("DROP TABLE workshop_breakouts"))
+                conn.execute(text("ALTER TABLE workshop_breakouts_v101 RENAME TO workshop_breakouts"))
         conn.execute(text("""
         CREATE TABLE IF NOT EXISTS participant_submissions (
             submission_id TEXT PRIMARY KEY,
@@ -1079,17 +1111,29 @@ def workshop_configuration_view():
             else:
                 wid = f"WS-{uuid.uuid4().hex[:8].upper()}"
                 codes = [f"BLUE{i}" if code_style.startswith("BLUE") else f"B{i}" for i in range(1, int(number_breakouts)+1)]
-                with engine.begin() as conn:
-                    conn.execute(text("UPDATE workshops SET is_active=0"))
-                    conn.execute(text("""
-                        INSERT INTO workshops (workshop_id, workshop_name, event_name, event_date, participant_target, duration_minutes, is_active, created_at)
-                        VALUES (:wid,:name,:event,:date,:target,:duration,1,:created)
-                    """), {"wid":wid,"name":workshop_name.strip(),"event":event_name.strip(),"date":str(event_date),"target":int(participant_target),"duration":int(duration_minutes),"created":now_iso()})
-                    conn.execute(text("INSERT INTO workshop_state (workshop_id, submissions_locked, results_revealed, updated_at) VALUES (:wid,0,0,:updated)"), {"wid":wid,"updated":now_iso()})
-                    for i, code in enumerate(codes,1):
-                        conn.execute(text("INSERT INTO workshop_breakouts (workshop_id, breakout_code, breakout_name) VALUES (:wid,:code,:name)"), {"wid":wid,"code":code,"name":f"Breakout {i}"})
-                st.success("Workshop created.")
-                st.rerun()
+                try:
+                    with engine.begin() as conn:
+                        conn.execute(text("UPDATE workshops SET is_active=0"))
+                        conn.execute(text("""
+                            INSERT INTO workshops (workshop_id, workshop_name, event_name, event_date, participant_target, duration_minutes, is_active, created_at)
+                            VALUES (:wid,:name,:event,:date,:target,:duration,1,:created)
+                        """), {"wid":wid,"name":workshop_name.strip(),"event":event_name.strip(),"date":str(event_date),"target":int(participant_target),"duration":int(duration_minutes),"created":now_iso()})
+                        conn.execute(text("INSERT INTO workshop_state (workshop_id, submissions_locked, results_revealed, updated_at) VALUES (:wid,0,0,:updated)"), {"wid":wid,"updated":now_iso()})
+                        for i, code in enumerate(codes,1):
+                            conn.execute(text("""
+                                INSERT INTO workshop_breakouts
+                                    (workshop_id, breakout_code, breakout_name)
+                                VALUES (:wid,:code,:name)
+                            """), {"wid":wid,"code":code,"name":f"Breakout {i}"})
+                    st.success("Workshop created.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(
+                        "The workshop could not be created. The most likely cause is an older "
+                        "database schema retained from a previous deployment. V1.0.1 includes "
+                        "an automatic migration. Restart/redeploy once and try again."
+                    )
+                    st.exception(exc)
 
     wid = select_workshop("Workshop to manage", key="config_workshop")
     if not wid:
@@ -1136,30 +1180,23 @@ def workshop_configuration_view():
         st.markdown("**Breakout lead links**")
         for _, br in load_breakouts(wid).iterrows():
             st.code(f"{base_url}/?lead=1&workshop={wid}&group={br['breakout_code']}", language=None)
-        st.markdown("**Private staff link**")
-        st.code(f"{base_url}/?staff=1", language=None)
-        st.caption("Facilitator and configuration pages are only shown when the URL contains ?staff=1, and still require the facilitator PIN.")
+        st.markdown("**Facilitator link**")
+        st.code(base_url, language=None)
+        st.caption("Facilitator and Workshop configuration remain protected by the facilitator PIN.")
 
 # -----------------------------------------------------------------------------
 # Navigation
 # -----------------------------------------------------------------------------
 header()
-staff_mode = str(st.query_params.get("staff", "0")) == "1"
 lead_mode = str(st.query_params.get("lead", "0")) == "1"
-if staff_mode:
-    nav_options = ["Participant", "Breakout lead", "Facilitator", "Workshop configuration"]
-    default_idx = 2
-elif lead_mode:
-    nav_options = ["Participant", "Breakout lead"]
-    default_idx = 1
-else:
-    nav_options = ["Participant", "Breakout lead"]
-    default_idx = 0
+
+nav_options = ["Participant", "Breakout lead", "Facilitator", "Workshop configuration"]
+default_idx = 1 if lead_mode else 0
+
 mode = st.sidebar.radio("View", nav_options, index=default_idx)
 st.sidebar.markdown("---")
-st.sidebar.caption("WBCSD · CDR Decision Lab · Version 1.0")
-if not staff_mode:
-    st.sidebar.caption("Facilitator controls are hidden from participant links.")
+st.sidebar.caption("WBCSD · CDR Decision Lab · Version 1.0.1")
+st.sidebar.caption("Breakout lead and facilitator/admin areas are protected by separate PINs.")
 
 if mode == "Participant":
     participant_view()

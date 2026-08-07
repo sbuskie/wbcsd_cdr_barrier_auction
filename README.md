@@ -1,3 +1,30 @@
+# V1.0.5 participant-shareable PDF report
+
+The facilitator PDF now includes the same core information as the participant Reveal:
+
+1. **Every breakout - participant range vs coordinated decision**
+   - Internal barriers
+   - External enabling environment
+   - Low-to-high individual range
+   - Participant average
+   - Final coordinated breakout decision
+
+2. **How the breakouts made their final allocations**
+   - Stacked 100-unit internal budget comparison across all breakouts
+   - Stacked 100-unit external enabling-priority comparison across all breakouts
+
+The PDF then continues with the workshop-wide rankings, qualitative themes and breakout report-backs, including the group's rationale and recommended WBCSD intervention where submitted.
+
+# V1.0.4 reveal and chart-legibility update
+
+- Moved the low / average / high + breakout-decision chart legend to the bottom of every chart so it no longer overlaps the chart title.
+- Simplified the participant Reveal view to mirror the facilitator's breakout-comparison experience.
+- Reveal now contains only:
+  1. Every breakout · participant range vs coordinated decision, using expandable breakout sections.
+  2. How the breakouts made their final allocations, using stacked 100-unit comparisons for internal and external priorities.
+- Removed the previous standalone reveal charts, heat maps and barrier-comparison content from the participant Reveal experience.
+- Facilitator analytical views remain unchanged, apart from the improved bottom legend placement.
+
 # V1.0.3 breakout decision and reveal update
 
 - Breakout lead allocation is now sequential, matching the participant flow: Internal first, External second, then qualitative questions.

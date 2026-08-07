@@ -16,6 +16,7 @@ from reportlab.lib.enums import TA_LEFT
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
+from reportlab.graphics.shapes import Circle, Drawing, Line, Polygon, Rect, String
 from reportlab.platypus import (
     Image as RLImage,
     PageBreak,
@@ -609,8 +610,14 @@ def range_plot_with_consensus(df, mapping, title, color, consensus_row=None):
         yaxis_title=None,
         height=max(330, 58 * len(base) + 100),
         plot_bgcolor="white",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-        margin=dict(l=10, r=20, t=70, b=20),
+        legend=dict(
+            orientation="h",
+            yanchor="top",
+            y=-0.18,
+            xanchor="left",
+            x=0,
+        ),
+        margin=dict(l=10, r=20, t=55, b=85),
     )
     return fig
 
@@ -656,24 +663,71 @@ def pdf_hex(hex_color):
 
 
 def build_pdf_report(workshop_row, participants, consensus, breakouts, theme_summary=None):
+    """
+    Generate a participant-shareable WBCSD report.
+
+    The first section mirrors the live Reveal:
+      1. Every breakout - participant low/average/high range vs coordinated decision.
+      2. How the breakouts made their final allocations - stacked 100-unit comparison.
+    It then adds workshop-wide rankings, qualitative themes and breakout report-backs.
+    """
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
-        buf, pagesize=A4, rightMargin=15*mm, leftMargin=15*mm, topMargin=17*mm, bottomMargin=17*mm,
-        title=f"{workshop_row['workshop_name']} - CDR Barrier Auction",
+        buf,
+        pagesize=A4,
+        rightMargin=15*mm,
+        leftMargin=15*mm,
+        topMargin=17*mm,
+        bottomMargin=17*mm,
+        title=f"{workshop_row['workshop_name']} - CDR Decision Lab",
     )
+
     styles = getSampleStyleSheet()
     styles.add(ParagraphStyle(
-        name="WTitle", parent=styles["Title"], fontName="Helvetica", fontSize=22, leading=25,
-        textColor=pdf_hex(COLORS["charcoal"]), alignment=TA_LEFT, spaceAfter=8,
+        name="WTitle",
+        parent=styles["Title"],
+        fontName="Helvetica",
+        fontSize=22,
+        leading=25,
+        textColor=pdf_hex(COLORS["charcoal"]),
+        alignment=TA_LEFT,
+        spaceAfter=8,
     ))
     styles.add(ParagraphStyle(
-        name="WH2", parent=styles["Heading2"], fontName="Helvetica-Bold", fontSize=13,
-        textColor=pdf_hex(COLORS["spruce"]), spaceBefore=9, spaceAfter=5,
+        name="WH2",
+        parent=styles["Heading2"],
+        fontName="Helvetica-Bold",
+        fontSize=13,
+        textColor=pdf_hex(COLORS["spruce"]),
+        spaceBefore=9,
+        spaceAfter=5,
     ))
     styles.add(ParagraphStyle(
-        name="WBody", parent=styles["BodyText"], fontName="Helvetica", fontSize=9.2, leading=12,
+        name="WH3",
+        parent=styles["Heading3"],
+        fontName="Helvetica-Bold",
+        fontSize=10.2,
+        textColor=pdf_hex(COLORS["charcoal"]),
+        spaceBefore=6,
+        spaceAfter=3,
+    ))
+    styles.add(ParagraphStyle(
+        name="WBody",
+        parent=styles["BodyText"],
+        fontName="Helvetica",
+        fontSize=9.2,
+        leading=12,
         textColor=pdf_hex(COLORS["charcoal"]),
     ))
+    styles.add(ParagraphStyle(
+        name="WSmall",
+        parent=styles["BodyText"],
+        fontName="Helvetica",
+        fontSize=7.5,
+        leading=9,
+        textColor=pdf_hex(COLORS["spruce"]),
+    ))
+
     story = []
     logo_path = Path("assets/wbcsd_logo.jpg")
     if logo_path.exists():
@@ -682,10 +736,342 @@ def build_pdf_report(workshop_row, participants, consensus, breakouts, theme_sum
     story.append(Paragraph(workshop_row["workshop_name"], styles["WTitle"]))
     story.append(Paragraph(
         f"{workshop_row.get('event_name') or ''} | {workshop_row.get('event_date') or ''} | "
-        f"{len(participants)} participant submissions | {participants['breakout_code'].nunique() if not participants.empty else 0} breakouts",
+        f"{len(participants)} participant submissions | "
+        f"{participants['breakout_code'].nunique() if not participants.empty else 0} breakouts",
         styles["WBody"],
     ))
-    story.append(Spacer(1, 5*mm))
+    story.append(Spacer(1, 4*mm))
+    story.append(Paragraph(
+        "This report captures the results revealed to participants: the range of individual views within each "
+        "breakout, the participant average, the coordinated breakout decision, and the final 100-unit allocations "
+        "made across all breakout groups.",
+        styles["WBody"],
+    ))
+
+    def consensus_row_for(code):
+        cdf = consensus[consensus["breakout_code"] == code]
+        return cdf.iloc[0].to_dict() if not cdf.empty else None
+
+    def pdf_range_chart(group_df, mapping, consensus_row, title):
+        """
+        Compact vector chart: barrier label, low-high line, average dot and
+        coordinated-decision diamond on a 0-100 scale.
+        """
+        rows = []
+        for barrier, col in mapping.items():
+            rows.append({
+                "Barrier": barrier,
+                "Low": float(group_df[col].min()),
+                "Average": float(group_df[col].mean()),
+                "High": float(group_df[col].max()),
+                "Consensus": (
+                    float(consensus_row[col])
+                    if consensus_row is not None
+                    and col in consensus_row
+                    and consensus_row[col] is not None
+                    and not pd.isna(consensus_row[col])
+                    else None
+                ),
+            })
+
+        chart_width = 172*mm
+        label_width = 61*mm
+        plot_left = label_width + 7*mm
+        plot_width = chart_width - plot_left - 6*mm
+        row_height = 7.2*mm
+        top_pad = 9*mm
+        bottom_pad = 13*mm
+        chart_height = top_pad + len(rows)*row_height + bottom_pad
+
+        d = Drawing(chart_width, chart_height)
+
+        # Title
+        d.add(String(
+            0,
+            chart_height - 4.5*mm,
+            title,
+            fontName="Helvetica-Bold",
+            fontSize=9.5,
+            fillColor=pdf_hex(COLORS["charcoal"]),
+        ))
+
+        # Axis/grid
+        grid_top = chart_height - top_pad - 1*mm
+        grid_bottom = bottom_pad
+        for tick in [0, 25, 50, 75, 100]:
+            x = plot_left + (tick / 100.0) * plot_width
+            d.add(Line(
+                x, grid_bottom, x, grid_top,
+                strokeColor=pdf_hex(COLORS["pearl"]),
+                strokeWidth=0.8,
+            ))
+            d.add(String(
+                x - 3*mm, 4.7*mm, str(tick),
+                fontName="Helvetica",
+                fontSize=6.4,
+                fillColor=pdf_hex(COLORS["spruce"]),
+            ))
+
+        for idx, r in enumerate(rows):
+            y = grid_top - idx*row_height - 3.5*mm
+            label = r["Barrier"]
+            if len(label) > 31:
+                label = label[:29] + "..."
+            d.add(String(
+                0, y - 1.8,
+                label,
+                fontName="Helvetica",
+                fontSize=7.2,
+                fillColor=pdf_hex(COLORS["charcoal"]),
+            ))
+
+            x_low = plot_left + (r["Low"]/100.0)*plot_width
+            x_avg = plot_left + (r["Average"]/100.0)*plot_width
+            x_high = plot_left + (r["High"]/100.0)*plot_width
+
+            d.add(Line(
+                x_low, y, x_high, y,
+                strokeColor=pdf_hex(COLORS["sand"]),
+                strokeWidth=5.5,
+                strokeLineCap=1,
+            ))
+            d.add(Circle(
+                x_avg, y, 2.1*mm,
+                fillColor=pdf_hex(COLORS["orange"]),
+                strokeColor=pdf_hex(COLORS["orange"]),
+            ))
+
+            if r["Consensus"] is not None:
+                x_c = plot_left + (r["Consensus"]/100.0)*plot_width
+                s = 2.4*mm
+                d.add(Polygon(
+                    [x_c, y+s, x_c+s, y, x_c, y-s, x_c-s, y],
+                    fillColor=pdf_hex(COLORS["charcoal"]),
+                    strokeColor=pdf_hex(COLORS["charcoal"]),
+                ))
+
+            d.add(String(
+                chart_width - 5*mm, y - 1.8,
+                f"{r['Average']:.1f}",
+                textAnchor="end",
+                fontName="Helvetica-Bold",
+                fontSize=6.8,
+                fillColor=pdf_hex(COLORS["orange"]),
+            ))
+
+        # Legend at bottom - deliberately away from the title.
+        legend_y = 1.4*mm
+        lx = plot_left
+        d.add(Line(
+            lx, legend_y + 1.8*mm, lx + 8*mm, legend_y + 1.8*mm,
+            strokeColor=pdf_hex(COLORS["sand"]),
+            strokeWidth=4.5,
+        ))
+        d.add(String(
+            lx + 10*mm, legend_y,
+            "Low-high",
+            fontName="Helvetica",
+            fontSize=6.5,
+            fillColor=pdf_hex(COLORS["spruce"]),
+        ))
+        lx += 31*mm
+        d.add(Circle(
+            lx, legend_y + 1.8*mm, 1.7*mm,
+            fillColor=pdf_hex(COLORS["orange"]),
+            strokeColor=pdf_hex(COLORS["orange"]),
+        ))
+        d.add(String(
+            lx + 4*mm, legend_y,
+            "Participant average",
+            fontName="Helvetica",
+            fontSize=6.5,
+            fillColor=pdf_hex(COLORS["spruce"]),
+        ))
+        lx += 43*mm
+        s = 1.9*mm
+        d.add(Polygon(
+            [lx, legend_y+1.8*mm+s, lx+s, legend_y+1.8*mm, lx, legend_y+1.8*mm-s, lx-s, legend_y+1.8*mm],
+            fillColor=pdf_hex(COLORS["charcoal"]),
+            strokeColor=pdf_hex(COLORS["charcoal"]),
+        ))
+        d.add(String(
+            lx + 4*mm, legend_y,
+            "Breakout decision",
+            fontName="Helvetica",
+            fontSize=6.5,
+            fillColor=pdf_hex(COLORS["spruce"]),
+        ))
+        return d
+
+    def pdf_consensus_stacked_chart(consensus_df, mapping, title):
+        """Stacked 100-unit horizontal bars comparing final breakout decisions."""
+        chart_width = 172*mm
+        label_width = 27*mm
+        plot_left = label_width
+        plot_width = chart_width - plot_left - 4*mm
+        row_height = 10*mm
+        top_pad = 10*mm
+        legend_rows = math.ceil(len(mapping) / 3)
+        bottom_pad = (legend_rows * 8 + 7)*mm
+        chart_height = top_pad + max(1, len(consensus_df))*row_height + bottom_pad
+
+        d = Drawing(chart_width, chart_height)
+        d.add(String(
+            0,
+            chart_height - 4.5*mm,
+            title,
+            fontName="Helvetica-Bold",
+            fontSize=10,
+            fillColor=pdf_hex(COLORS["charcoal"]),
+        ))
+
+        palette = [
+            COLORS["orange"], COLORS["spruce"], COLORS["olive"],
+            COLORS["sky"], COLORS["sand"], COLORS["sage"], COLORS["salmon"],
+        ]
+        categories = list(mapping.items())
+        y_top = chart_height - top_pad - 2*mm
+
+        for ridx, (_, r) in enumerate(consensus_df.sort_values("breakout_code").iterrows()):
+            y = y_top - ridx*row_height - 4*mm
+            d.add(String(
+                0, y - 1.8,
+                str(r["breakout_code"]),
+                fontName="Helvetica-Bold",
+                fontSize=7.5,
+                fillColor=pdf_hex(COLORS["charcoal"]),
+            ))
+            x = plot_left
+            for cidx, (barrier, col) in enumerate(categories):
+                val = max(0.0, float(r[col] or 0))
+                seg_w = (val / 100.0) * plot_width
+                if seg_w > 0:
+                    d.add(Rect(
+                        x, y - 2.7*mm, seg_w, 5.4*mm,
+                        fillColor=pdf_hex(palette[cidx % len(palette)]),
+                        strokeColor=rl_colors.white,
+                        strokeWidth=0.35,
+                    ))
+                    if seg_w >= 11*mm:
+                        d.add(String(
+                            x + seg_w/2, y - 1.4,
+                            f"{int(round(val))}",
+                            textAnchor="middle",
+                            fontName="Helvetica-Bold",
+                            fontSize=6.2,
+                            fillColor=pdf_hex(COLORS["charcoal"]),
+                        ))
+                x += seg_w
+
+        # Legend below bars
+        legend_y_top = bottom_pad - 8*mm
+        col_w = chart_width / 3
+        for idx, (barrier, _) in enumerate(categories):
+            row = idx // 3
+            col = idx % 3
+            x = col * col_w
+            y = legend_y_top - row*8*mm
+            d.add(Rect(
+                x, y, 4*mm, 4*mm,
+                fillColor=pdf_hex(palette[idx % len(palette)]),
+                strokeColor=None,
+            ))
+            label = barrier if len(barrier) <= 28 else barrier[:26] + "..."
+            d.add(String(
+                x + 6*mm, y + 0.4*mm,
+                label,
+                fontName="Helvetica",
+                fontSize=6.4,
+                fillColor=pdf_hex(COLORS["spruce"]),
+            ))
+        return d
+
+    # ------------------------------------------------------------------
+    # REVEALED RESULTS SUMMARY
+    # ------------------------------------------------------------------
+    story.append(PageBreak())
+    story.append(Paragraph("Revealed results summary", styles["WTitle"]))
+    story.append(Paragraph(
+        "The following pages reproduce the core results shown to participants during the live reveal.",
+        styles["WBody"],
+    ))
+    story.append(Spacer(1, 3*mm))
+
+    story.append(Paragraph(
+        "Every breakout - participant range vs coordinated decision",
+        styles["WH2"],
+    ))
+    story.append(Paragraph(
+        "The line is the lowest-to-highest individual response within the breakout. "
+        "The orange dot is the participant average. The charcoal diamond is the final coordinated allocation "
+        "submitted by the breakout lead.",
+        styles["WBody"],
+    ))
+
+    if participants.empty:
+        story.append(Paragraph("No participant responses were recorded.", styles["WBody"]))
+    else:
+        for _, br in breakouts.iterrows():
+            code = br["breakout_code"]
+            group = participants[participants["breakout_code"] == code]
+            if group.empty:
+                continue
+            c_row = consensus_row_for(code)
+
+            story.append(Spacer(1, 4*mm))
+            title = f"{code}"
+            if br.get("breakout_name"):
+                title += f" - {br.get('breakout_name')}"
+            title += f" | {len(group)} participant responses"
+            story.append(Paragraph(title, styles["WH3"]))
+            story.append(pdf_range_chart(
+                group,
+                INTERNAL_DB,
+                c_row,
+                "Internal barriers",
+            ))
+            story.append(Spacer(1, 2*mm))
+            story.append(pdf_range_chart(
+                group,
+                EXTERNAL_DB,
+                c_row,
+                "External enabling environment",
+            ))
+            if c_row is None:
+                story.append(Paragraph(
+                    "No coordinated breakout allocation had been submitted at the time this report was generated.",
+                    styles["WSmall"],
+                ))
+            story.append(PageBreak())
+
+    story.append(Paragraph("How the breakouts made their final allocations", styles["WTitle"]))
+    story.append(Paragraph(
+        "Each bar totals 100 and shows the final coordinated allocation submitted by that breakout. "
+        "These charts make it easy to compare where the groups converged and where they made different trade-offs.",
+        styles["WBody"],
+    ))
+    story.append(Spacer(1, 4*mm))
+
+    if consensus.empty:
+        story.append(Paragraph("No breakout coordinated allocations were submitted.", styles["WBody"]))
+    else:
+        story.append(pdf_consensus_stacked_chart(
+            consensus,
+            INTERNAL_DB,
+            "Internal budget - breakout comparison",
+        ))
+        story.append(Spacer(1, 6*mm))
+        story.append(pdf_consensus_stacked_chart(
+            consensus,
+            EXTERNAL_DB,
+            "External enabling priorities - breakout comparison",
+        ))
+
+    # ------------------------------------------------------------------
+    # WORKSHOP-WIDE SUMMARY
+    # ------------------------------------------------------------------
+    story.append(PageBreak())
+    story.append(Paragraph("Workshop-wide summary", styles["WTitle"]))
 
     def add_summary_section(title, mapping):
         story.append(Paragraph(title, styles["WH2"]))
@@ -694,7 +1080,11 @@ def build_pdf_report(workshop_row, participants, consensus, breakouts, theme_sum
             [int(r["Rank"]), r["Barrier"], r["Low"], r["Average"], r["High"], r["Agreement"]]
             for _, r in sm.iterrows()
         ]
-        table = Table(data, colWidths=[11*mm, 66*mm, 18*mm, 21*mm, 18*mm, 24*mm], repeatRows=1)
+        table = Table(
+            data,
+            colWidths=[11*mm, 66*mm, 18*mm, 21*mm, 18*mm, 24*mm],
+            repeatRows=1,
+        )
         table.setStyle(TableStyle([
             ("BACKGROUND", (0,0), (-1,0), pdf_hex(COLORS["charcoal"])),
             ("TEXTCOLOR", (0,0), (-1,0), rl_colors.white),
@@ -704,7 +1094,8 @@ def build_pdf_report(workshop_row, participants, consensus, breakouts, theme_sum
             ("GRID", (0,0), (-1,-1), .35, pdf_hex(COLORS["sand"])),
             ("ROWBACKGROUNDS", (0,1), (-1,-1), [rl_colors.white, pdf_hex(COLORS["pearl"])]),
             ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
-            ("LEFTPADDING", (0,0), (-1,-1), 4), ("RIGHTPADDING", (0,0), (-1,-1), 4),
+            ("LEFTPADDING", (0,0), (-1,-1), 4),
+            ("RIGHTPADDING", (0,0), (-1,-1), 4),
         ]))
         story.append(table)
 
@@ -714,41 +1105,79 @@ def build_pdf_report(workshop_row, participants, consensus, breakouts, theme_sum
 
     if theme_summary is not None and not theme_summary.empty:
         story.append(Paragraph("Qualitative themes", styles["WH2"]))
-        data = [["Theme", "Responses"]] + [[r["Theme"], int(r["Responses"])] for _, r in theme_summary.iterrows()]
+        data = [["Theme", "Responses"]] + [
+            [r["Theme"], int(r["Responses"])]
+            for _, r in theme_summary.iterrows()
+        ]
         table = Table(data, colWidths=[130*mm, 28*mm])
         table.setStyle(TableStyle([
-            ("BACKGROUND", (0,0), (-1,0), pdf_hex(COLORS["spruce"])), ("TEXTCOLOR", (0,0), (-1,0), rl_colors.white),
-            ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"), ("FONTNAME", (0,1), (-1,-1), "Helvetica"),
-            ("FONTSIZE", (0,0), (-1,-1), 8.5), ("GRID", (0,0), (-1,-1), .35, pdf_hex(COLORS["sand"])),
+            ("BACKGROUND", (0,0), (-1,0), pdf_hex(COLORS["spruce"])),
+            ("TEXTCOLOR", (0,0), (-1,0), rl_colors.white),
+            ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+            ("FONTNAME", (0,1), (-1,-1), "Helvetica"),
+            ("FONTSIZE", (0,0), (-1,-1), 8.5),
+            ("GRID", (0,0), (-1,-1), .35, pdf_hex(COLORS["sand"])),
         ]))
         story.append(table)
 
+    # ------------------------------------------------------------------
+    # BREAKOUT REPORT-BACKS
+    # ------------------------------------------------------------------
     story.append(PageBreak())
     story.append(Paragraph("Breakout report-backs", styles["WTitle"]))
+
     for _, br in breakouts.iterrows():
         code = br["breakout_code"]
         group = participants[participants["breakout_code"] == code]
-        c_row = consensus[consensus["breakout_code"] == code]
-        story.append(Paragraph(f"{code} - {br.get('breakout_name') or ''}", styles["WH2"]))
+        c_row_df = consensus[consensus["breakout_code"] == code]
+
+        story.append(Paragraph(
+            f"{code} - {br.get('breakout_name') or ''}",
+            styles["WH2"],
+        ))
+
         if group.empty:
             story.append(Paragraph("No participant responses recorded.", styles["WBody"]))
             continue
+
         int_top = summary_table(group, INTERNAL_DB).iloc[0]
         ext_top = summary_table(group, EXTERNAL_DB).iloc[0]
+
         summary_data = [
             ["Submissions", len(group)],
             ["Highest internal priority", f"{int_top['Barrier']} ({int_top['Average']:.1f})"],
             ["Highest external priority", f"{ext_top['Barrier']} ({ext_top['Average']:.1f})"],
         ]
-        if not c_row.empty:
-            summary_data.append(["Recommended WBCSD intervention", c_row.iloc[0]["wbcsd_intervention"] or "Not recorded"])
+
+        if not c_row_df.empty:
+            crow = c_row_df.iloc[0]
+            summary_data.append([
+                "Recommended WBCSD intervention",
+                crow["wbcsd_intervention"] or "Not recorded",
+            ])
+
         t = Table(summary_data, colWidths=[48*mm, 110*mm])
         t.setStyle(TableStyle([
-            ("BACKGROUND", (0,0), (0,-1), pdf_hex(COLORS["pearl"])), ("FONTNAME", (0,0), (0,-1), "Helvetica-Bold"),
-            ("FONTNAME", (1,0), (1,-1), "Helvetica"), ("FONTSIZE", (0,0), (-1,-1), 8.2),
-            ("GRID", (0,0), (-1,-1), .35, pdf_hex(COLORS["sand"])), ("VALIGN", (0,0), (-1,-1), "TOP"),
+            ("BACKGROUND", (0,0), (0,-1), pdf_hex(COLORS["pearl"])),
+            ("FONTNAME", (0,0), (0,-1), "Helvetica-Bold"),
+            ("FONTNAME", (1,0), (1,-1), "Helvetica"),
+            ("FONTSIZE", (0,0), (-1,-1), 8.2),
+            ("GRID", (0,0), (-1,-1), .35, pdf_hex(COLORS["sand"])),
+            ("VALIGN", (0,0), (-1,-1), "TOP"),
         ]))
         story.append(t)
+
+        if not c_row_df.empty:
+            crow = c_row_df.iloc[0]
+            story.append(Spacer(1, 3*mm))
+            story.append(Paragraph(
+                "<b>Why the group made this allocation</b>",
+                styles["WBody"],
+            ))
+            story.append(Paragraph(
+                crow["rationale"] or "Not recorded",
+                styles["WBody"],
+            ))
         story.append(Spacer(1, 4*mm))
 
     def footer(canvas, doc_obj):
@@ -757,7 +1186,11 @@ def build_pdf_report(workshop_row, participants, consensus, breakouts, theme_sum
         canvas.rect(0, 0, A4[0], 4*mm, fill=1, stroke=0)
         canvas.setFont("Helvetica", 7.5)
         canvas.setFillColor(pdf_hex(COLORS["charcoal"]))
-        canvas.drawRightString(A4[0]-15*mm, 8*mm, f"WBCSD CDR Decision Lab | Page {doc_obj.page}")
+        canvas.drawRightString(
+            A4[0]-15*mm,
+            8*mm,
+            f"WBCSD CDR Decision Lab | Page {doc_obj.page}",
+        )
         canvas.restoreState()
 
     doc.build(story, onFirstPage=footer, onLaterPages=footer)
@@ -825,53 +1258,106 @@ def participant_reveal_fragment(workshop_id, breakout_code):
     group = group[group["breakout_code"] == breakout_code]
     if group.empty:
         return
-    st.markdown('<div class="reveal"><div class="callout"><b>Results revealed</b> - this view updates as your breakout completes its individual submissions and coordinated decision.</div></div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="reveal"><div class="callout"><b>Results revealed</b> - compare how each breakout thought about the barriers and the coordinated decisions they ultimately made.</div></div>',
+        unsafe_allow_html=True,
+    )
 
+    participants = load_participants(workshop_id)
     consensus = load_consensus(workshop_id)
-    cdf = consensus[consensus["breakout_code"] == breakout_code]
-    consensus_row = cdf.iloc[0].to_dict() if not cdf.empty else None
+    breakouts = load_breakouts(workshop_id)
 
-    c1, c2 = st.columns(2)
-    with c1:
-        st.plotly_chart(
-            range_plot_with_consensus(
-                group, INTERNAL_DB,
-                "Internal barriers · low / average / high + breakout decision",
-                COLORS["orange"], consensus_row,
-            ),
-            use_container_width=True,
-            key=f"participant_int_{workshop_id}_{breakout_code}",
-        )
-    with c2:
-        st.plotly_chart(
-            range_plot_with_consensus(
-                group, EXTERNAL_DB,
-                "External enabling environment · low / average / high + breakout decision",
-                COLORS["spruce"], consensus_row,
-            ),
-            use_container_width=True,
-            key=f"participant_ext_{workshop_id}_{breakout_code}",
-        )
+    st.markdown("### Every breakout · participant range vs coordinated decision")
+    st.caption(
+        "Open each breakout to see the lowest-to-highest individual response, the participant average, "
+        "and the final coordinated allocation submitted by the breakout lead."
+    )
 
-    if consensus_row is None:
-        st.caption("The breakout consensus marker will appear once the breakout lead submits the coordinated allocation.")
+    for code in breakouts["breakout_code"].tolist():
+        group_df = participants[participants["breakout_code"] == code]
+        if group_df.empty:
+            continue
 
-    if not consensus.empty:
-        st.markdown("### How the breakouts made their final allocations")
-        st.caption("Each column totals 100 and shows the final coordinated decision submitted by that breakout.")
-        s1, s2 = st.columns(2)
-        with s1:
-            fig = consensus_comparison_chart(consensus, INTERNAL_DB, "Internal budget · breakout comparison")
+        cdf = consensus[consensus["breakout_code"] == code]
+        consensus_row = cdf.iloc[0].to_dict() if not cdf.empty else None
+
+        breakout_name_series = breakouts.loc[breakouts["breakout_code"] == code, "breakout_name"]
+        breakout_name = breakout_name_series.iloc[0] if not breakout_name_series.empty else ""
+        label = f"{code}"
+        if breakout_name:
+            label += f" · {breakout_name}"
+        label += f" · {len(group_df)} participant responses"
+
+        with st.expander(label, expanded=False):
+            left, right = st.columns(2)
+
+            with left:
+                st.plotly_chart(
+                    range_plot_with_consensus(
+                        group_df,
+                        INTERNAL_DB,
+                        "Internal barriers",
+                        COLORS["orange"],
+                        consensus_row,
+                    ),
+                    use_container_width=True,
+                    key=f"reveal_range_int_{workshop_id}_{code}",
+                )
+
+            with right:
+                st.plotly_chart(
+                    range_plot_with_consensus(
+                        group_df,
+                        EXTERNAL_DB,
+                        "External enabling environment",
+                        COLORS["spruce"],
+                        consensus_row,
+                    ),
+                    use_container_width=True,
+                    key=f"reveal_range_ext_{workshop_id}_{code}",
+                )
+
+            if consensus_row is None:
+                st.caption(
+                    "The coordinated-decision marker will appear when this breakout submits its final allocation."
+                )
+
+    st.markdown("### How the breakouts made their final allocations")
+    st.caption(
+        "Each stacked column totals 100 and shows the final coordinated allocation submitted by that breakout."
+    )
+
+    if consensus.empty:
+        st.info("No breakout coordinated allocations have been submitted yet.")
+    else:
+        left, right = st.columns(2)
+
+        with left:
+            fig = consensus_comparison_chart(
+                consensus,
+                INTERNAL_DB,
+                "Internal budget · breakout comparison",
+            )
             if fig is not None:
-                st.plotly_chart(fig, use_container_width=True, key=f"participant_cons_int_{workshop_id}")
-        with s2:
-            fig = consensus_comparison_chart(consensus, EXTERNAL_DB, "External enabling priorities · breakout comparison")
-            if fig is not None:
-                st.plotly_chart(fig, use_container_width=True, key=f"participant_cons_ext_{workshop_id}")
+                st.plotly_chart(
+                    fig,
+                    use_container_width=True,
+                    key=f"reveal_consensus_internal_{workshop_id}",
+                )
 
-# -----------------------------------------------------------------------------
-# Participant
-# -----------------------------------------------------------------------------
+        with right:
+            fig = consensus_comparison_chart(
+                consensus,
+                EXTERNAL_DB,
+                "External enabling priorities · breakout comparison",
+            )
+            if fig is not None:
+                st.plotly_chart(
+                    fig,
+                    use_container_width=True,
+                    key=f"reveal_consensus_external_{workshop_id}",
+                )
+
 def participant_view():
     st.markdown('<div class="section-label">01 · Individual perspective</div>', unsafe_allow_html=True)
     st.subheader("Where would you allocate scarce attention and resources?")
@@ -1452,7 +1938,7 @@ default_idx = 1 if lead_mode else 0
 
 mode = st.sidebar.radio("View", nav_options, index=default_idx)
 st.sidebar.markdown("---")
-st.sidebar.caption("WBCSD · CDR Decision Lab · Version 1.0.3")
+st.sidebar.caption("WBCSD · CDR Decision Lab · Version 1.0.5")
 st.sidebar.caption("Breakout lead and facilitator/admin areas are protected by separate PINs.")
 
 if mode == "Participant":

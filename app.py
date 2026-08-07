@@ -255,15 +255,29 @@ def init_db():
             PRIMARY KEY (workshop_id, breakout_code)
         )"""))
 
-        # Lightweight migration for pre-V1.0 databases.
-        for table_name, column_name, column_type in [
-            ("participant_submissions", "workshop_id", "TEXT"),
-            ("breakout_consensus", "workshop_id", "TEXT"),
-        ]:
-            try:
-                conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}"))
-            except Exception:
-                pass
+        # Database-aware migration for pre-V1.0 databases.
+        # PostgreSQL aborts the entire transaction after a failed statement,
+        # so never rely on try/except around ALTER TABLE there.
+        if DATABASE_URL.startswith("sqlite"):
+            for table_name, column_name, column_type in [
+                ("participant_submissions", "workshop_id", "TEXT"),
+                ("breakout_consensus", "workshop_id", "TEXT"),
+            ]:
+                existing = conn.execute(text(f"PRAGMA table_info({table_name})")).fetchall()
+                existing_cols = {row[1] for row in existing}
+                if column_name not in existing_cols:
+                    conn.execute(text(
+                        f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}"
+                    ))
+        else:
+            conn.execute(text(
+                "ALTER TABLE participant_submissions "
+                "ADD COLUMN IF NOT EXISTS workshop_id TEXT"
+            ))
+            conn.execute(text(
+                "ALTER TABLE breakout_consensus "
+                "ADD COLUMN IF NOT EXISTS workshop_id TEXT"
+            ))
 
         # Ensure older configured workshops have state rows.
         workshop_ids = conn.execute(text("SELECT workshop_id FROM workshops")).fetchall()
@@ -308,6 +322,78 @@ def load_consensus(workshop_id=None):
             engine, params={"wid": workshop_id},
         )
     return pd.read_sql("SELECT * FROM breakout_consensus ORDER BY workshop_id, breakout_code", engine)
+
+
+
+def database_backend_label():
+    if DATABASE_URL.startswith("sqlite"):
+        return "SQLite"
+    if "supabase" in DATABASE_URL or "pooler.supabase.com" in DATABASE_URL:
+        return "Supabase PostgreSQL"
+    return "PostgreSQL"
+
+
+def database_health():
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return True
+    except Exception:
+        return False
+
+
+def workshop_submission_status(workshop_id):
+    breakouts = load_breakouts(workshop_id)
+    participants = load_participants(workshop_id)
+    consensus = load_consensus(workshop_id)
+    workshops = load_workshops()
+    ws = workshops[workshops["workshop_id"] == workshop_id]
+
+    target = int(ws.iloc[0]["participant_target"] or 0) if not ws.empty else 0
+    breakout_count = max(len(breakouts), 1)
+    expected_per_breakout = int(round(target / breakout_count)) if target else None
+
+    rows = []
+    for _, br in breakouts.iterrows():
+        code = br["breakout_code"]
+        submitted = int((participants["breakout_code"] == code).sum()) if not participants.empty else 0
+        consensus_done = bool((consensus["breakout_code"] == code).any()) if not consensus.empty else False
+        rows.append({
+            "Breakout": code,
+            "Name": br.get("breakout_name") or "",
+            "Expected": expected_per_breakout if expected_per_breakout is not None else "",
+            "Submitted": submitted,
+            "Consensus": "Complete" if consensus_done else "Pending",
+            "Ready": (
+                "Yes"
+                if consensus_done and (expected_per_breakout is None or submitted >= expected_per_breakout)
+                else "No"
+            ),
+        })
+    return pd.DataFrame(rows)
+
+
+def reset_workshop_responses(workshop_id):
+    """Clear all response/result data while retaining workshop configuration."""
+    with engine.begin() as conn:
+        conn.execute(
+            text("DELETE FROM participant_submissions WHERE workshop_id=:wid"),
+            {"wid": workshop_id},
+        )
+        conn.execute(
+            text("DELETE FROM breakout_consensus WHERE workshop_id=:wid"),
+            {"wid": workshop_id},
+        )
+        conn.execute(
+            text("""
+                UPDATE workshop_state
+                SET submissions_locked=0,
+                    results_revealed=0,
+                    updated_at=:updated
+                WHERE workshop_id=:wid
+            """),
+            {"wid": workshop_id, "updated": now_iso()},
+        )
 
 
 def load_workshop_state(workshop_id):
@@ -1649,6 +1735,16 @@ def facilitator_view():
 
     participants = load_participants(wid)
     consensus = load_consensus(wid)
+
+    st.markdown("### Submission status")
+    status_df = workshop_submission_status(wid)
+    if not status_df.empty:
+        st.dataframe(status_df, hide_index=True, use_container_width=True)
+    st.caption(
+        f"Database: {database_backend_label()} · "
+        f"{'connected' if database_health() else 'connection problem'}"
+    )
+
     workshops = load_workshops()
     wrow = workshops[workshops["workshop_id"] == wid].iloc[0].to_dict()
     breakouts = load_breakouts(wid)
@@ -1835,6 +1931,11 @@ def workshop_configuration_view():
     if not check_facilitator_pin(key="config_facilitator_pin"):
         return
 
+    if database_health():
+        st.success(f"Database connected: {database_backend_label()}")
+    else:
+        st.error(f"Database connection problem: {database_backend_label()}")
+
     with st.expander("Create a new workshop", expanded=load_workshops().empty):
         with st.form("create_workshop_form"):
             c1, c2 = st.columns(2)
@@ -1873,8 +1974,9 @@ def workshop_configuration_view():
                 except Exception as exc:
                     st.error(
                         "The workshop could not be created. The most likely cause is an older "
-                        "database schema retained from a previous deployment. V1.0.1 includes "
-                        "an automatic migration. Restart/redeploy once and try again."
+                        "database schema retained from a previous deployment. V1.1.0 includes "
+                        "database-aware migrations for both SQLite and PostgreSQL/Supabase. "
+                        "Restart/redeploy once and try again."
                     )
                     st.exception(exc)
 
@@ -1914,6 +2016,36 @@ def workshop_configuration_view():
             st.success("Breakouts saved.")
             st.rerun()
 
+    st.markdown("### Submission status")
+    status_df = workshop_submission_status(wid)
+    if status_df.empty:
+        st.info("No breakout groups configured.")
+    else:
+        st.dataframe(status_df, hide_index=True, use_container_width=True)
+
+    st.markdown("---")
+    st.markdown("### Danger zone")
+    st.warning(
+        "Resetting this workshop permanently deletes participant submissions, breakout consensus "
+        "allocations and qualitative responses for this workshop. Workshop configuration and breakout "
+        "groups are retained."
+    )
+    reset_confirmation = st.text_input(
+        "Type RESET to confirm",
+        key=f"reset_confirm_{wid}",
+        placeholder="RESET",
+    )
+    if st.button(
+        "Permanently clear workshop responses",
+        disabled=reset_confirmation.strip().upper() != "RESET",
+        use_container_width=True,
+        key=f"reset_button_{wid}",
+    ):
+        reset_workshop_responses(wid)
+        st.session_state[f"reset_confirm_{wid}"] = ""
+        st.success("Workshop responses cleared. Configuration and breakout groups were retained.")
+        st.rerun()
+
     st.markdown("### Links")
     base_url = st.text_input("Deployed app URL", placeholder="https://your-app.streamlit.app").rstrip("/")
     if base_url:
@@ -1938,7 +2070,7 @@ default_idx = 1 if lead_mode else 0
 
 mode = st.sidebar.radio("View", nav_options, index=default_idx)
 st.sidebar.markdown("---")
-st.sidebar.caption("WBCSD · CDR Decision Lab · Version 1.0.5")
+st.sidebar.caption("WBCSD · CDR Decision Lab · Version 1.1.0")
 st.sidebar.caption("Breakout lead and facilitator/admin areas are protected by separate PINs.")
 
 if mode == "Participant":

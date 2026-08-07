@@ -1,3 +1,26 @@
+# V1.1.0 Supabase and workshop operations
+
+## Supabase/PostgreSQL fix
+PostgreSQL migrations now use `ADD COLUMN IF NOT EXISTS` instead of catching a failing `ALTER TABLE` inside a transaction. This fixes the `InFailedSqlTransaction` startup error encountered after connecting Streamlit to Supabase.
+
+## Submission status
+Facilitator and Workshop configuration views now show breakout-level status:
+- expected participants (even split of the workshop target, for guidance only)
+- submitted individual responses
+- whether breakout consensus is complete
+- a simple ready/not-ready indicator
+
+## Workshop reset
+Workshop configuration now includes a facilitator-only danger zone. Typing `RESET` enables a workshop-specific reset that:
+- deletes participant submissions
+- deletes breakout consensus allocations
+- deletes associated qualitative responses
+- resets locked/revealed state
+- retains the workshop and breakout configuration
+
+## Database status
+Facilitator/admin views display the active backend and connection health, e.g. `Supabase PostgreSQL · connected`.
+
 # V1.0.5 participant-shareable PDF report
 
 The facilitator PDF now includes the same core information as the participant Reveal:

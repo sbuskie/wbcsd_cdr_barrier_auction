@@ -127,6 +127,25 @@ def init_db():
             conn.execute(text("PRAGMA journal_mode=WAL;"))
 
         conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS workshop_config (
+            config_id INTEGER PRIMARY KEY,
+            workshop_name TEXT NOT NULL,
+            event_name TEXT,
+            event_date TEXT,
+            participant_target INTEGER,
+            duration_minutes INTEGER,
+            updated_at TEXT NOT NULL
+        )
+        """))
+
+        conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS workshop_breakouts (
+            breakout_code TEXT PRIMARY KEY,
+            breakout_name TEXT
+        )
+        """))
+
+        conn.execute(text("""
         CREATE TABLE IF NOT EXISTS participant_submissions (
             submission_id TEXT PRIMARY KEY,
             submitted_at TEXT NOT NULL,
@@ -198,6 +217,13 @@ def load_participants():
 def load_consensus():
     return pd.read_sql("SELECT * FROM breakout_consensus ORDER BY breakout_code", engine)
 
+def load_workshop_config():
+    df = pd.read_sql("SELECT * FROM workshop_config WHERE config_id=1", engine)
+    return None if df.empty else df.iloc[0].to_dict()
+
+def load_breakouts():
+    return pd.read_sql("SELECT * FROM workshop_breakouts ORDER BY breakout_code", engine)
+
 def agreement_label(std):
     if pd.isna(std):
         return "n/a"
@@ -246,14 +272,25 @@ def header():
             unsafe_allow_html=True,
         )
 
-def check_pin():
-    expected = None
+def _secret_value(name, fallback):
+    value = None
     try:
-        expected = st.secrets.get("FACILITATOR_PIN")
+        value = st.secrets.get(name)
     except Exception:
-        expected = None
-    expected = expected or os.getenv("FACILITATOR_PIN") or "wbcsd-demo"
-    supplied = st.text_input("Facilitator PIN", type="password")
+        value = None
+    return value or os.getenv(name) or fallback
+
+def check_breakout_pin():
+    expected = _secret_value("BREAKOUT_LEAD_PIN", "breakout-demo")
+    supplied = st.text_input("Breakout lead PIN", type="password", key="breakout_lead_pin")
+    if supplied != expected:
+        st.info("Enter the breakout lead PIN to continue.")
+        return False
+    return True
+
+def check_facilitator_pin(key="facilitator_pin"):
+    expected = _secret_value("FACILITATOR_PIN", "wbcsd-demo")
+    supplied = st.text_input("Facilitator PIN", type="password", key=key)
     if supplied != expected:
         st.info("Enter the facilitator PIN to continue.")
         return False
@@ -279,7 +316,21 @@ def participant_view():
             sector = st.text_input("Sector")
         with c:
             cdr_maturity = st.selectbox("CDR maturity", MATURITY)
-            breakout_code = st.text_input("Breakout code", value=str(preset_breakout).upper()).strip().upper()
+            configured_breakouts = load_breakouts()
+            if not configured_breakouts.empty:
+                codes = configured_breakouts["breakout_code"].tolist()
+                preset = str(preset_breakout).upper()
+                idx = codes.index(preset) if preset in codes else 0
+                breakout_code = st.selectbox(
+                    "Breakout",
+                    codes,
+                    index=idx,
+                    format_func=lambda code: (
+                        f"{code} · " + str(configured_breakouts.loc[configured_breakouts["breakout_code"] == code, "breakout_name"].iloc[0] or "")
+                    ).rstrip(" ·"),
+                )
+            else:
+                breakout_code = st.text_input("Breakout code", value=str(preset_breakout).upper()).strip().upper()
 
     st.markdown("### Internal investment priorities")
     st.write("Allocate **exactly 100 units** across barriers your company can address through its own budget, capability and decision-making.")
@@ -353,11 +404,15 @@ def participant_view():
 def breakout_lead_view():
     st.subheader("2 · Breakout consensus")
     st.caption("Use this after discussing the individual results. Capture the coordinated decision the group would make together.")
-    if not check_pin():
+    if not check_breakout_pin():
         return
 
     participants = load_participants()
-    available = sorted(participants["breakout_code"].dropna().unique().tolist()) if not participants.empty else []
+    configured = load_breakouts()
+    if not configured.empty:
+        available = configured["breakout_code"].tolist()
+    else:
+        available = sorted(participants["breakout_code"].dropna().unique().tolist()) if not participants.empty else []
     breakout_code = st.selectbox("Breakout", available) if available else st.text_input("Breakout code").strip().upper()
     if not breakout_code:
         return
@@ -493,9 +548,95 @@ def breakout_report_html(code, group, consensus_row):
     </body></html>
     """.encode("utf-8")
 
+def workshop_configuration_view():
+    st.subheader("Workshop configuration")
+    st.caption("Create the workshop setup and breakout groups. This page uses the facilitator PIN and is not available with the breakout-lead PIN.")
+    if not check_facilitator_pin(key="configuration_pin"):
+        return
+
+    existing = load_workshop_config() or {}
+    st.markdown("### Workshop details")
+    with st.form("workshop_config_form"):
+        c1, c2 = st.columns(2)
+        with c1:
+            workshop_name = st.text_input("Workshop name", value=existing.get("workshop_name", "CDR Barrier Auction"))
+            event_name = st.text_input("Event / programme", value=existing.get("event_name", ""))
+            event_date = st.text_input("Event date", value=existing.get("event_date", ""), placeholder="e.g. 22 September 2026")
+        with c2:
+            participant_target = st.number_input("Expected participants", min_value=1, max_value=1000, value=int(existing.get("participant_target") or 40))
+            duration_minutes = st.number_input("Workshop duration (minutes)", min_value=10, max_value=240, value=int(existing.get("duration_minutes") or 45))
+            number_breakouts = st.number_input("Number of breakout groups", min_value=1, max_value=30, value=max(1, len(load_breakouts()) or 5))
+
+        code_style = st.selectbox("Default breakout codes", ["B1, B2, B3…", "BLUE1, BLUE2, BLUE3…"])
+        save_details = st.form_submit_button("Save workshop and generate groups", type="primary", use_container_width=True)
+
+    if save_details:
+        if not workshop_name.strip():
+            st.error("Workshop name is required.")
+        else:
+            prefix = "BLUE" if code_style.startswith("BLUE") else "B"
+            codes = [f"{prefix}{i}" for i in range(1, int(number_breakouts)+1)]
+            with engine.begin() as conn:
+                conn.execute(text("DELETE FROM workshop_config WHERE config_id=1"))
+                conn.execute(text("""
+                    INSERT INTO workshop_config
+                    (config_id, workshop_name, event_name, event_date, participant_target, duration_minutes, updated_at)
+                    VALUES (1, :workshop_name, :event_name, :event_date, :participant_target, :duration_minutes, :updated_at)
+                """), {
+                    "workshop_name": workshop_name.strip(),
+                    "event_name": event_name.strip(),
+                    "event_date": event_date.strip(),
+                    "participant_target": int(participant_target),
+                    "duration_minutes": int(duration_minutes),
+                    "updated_at": now_iso(),
+                })
+                conn.execute(text("DELETE FROM workshop_breakouts"))
+                for i, code in enumerate(codes, 1):
+                    conn.execute(text("INSERT INTO workshop_breakouts (breakout_code, breakout_name) VALUES (:code, :name)"), {"code": code, "name": f"Breakout {i}"})
+            st.success("Workshop configuration saved.")
+            st.rerun()
+
+    st.markdown("### Breakout groups")
+    groups = load_breakouts()
+    if groups.empty:
+        st.info("Save the workshop details above to generate breakout groups.")
+        return
+
+    edited = st.data_editor(
+        groups,
+        hide_index=True,
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={
+            "breakout_code": st.column_config.TextColumn("Code", required=True),
+            "breakout_name": st.column_config.TextColumn("Name"),
+        },
+        key="breakout_configuration_editor",
+    )
+    if st.button("Save edited breakout groups", use_container_width=True):
+        clean = edited.copy()
+        clean["breakout_code"] = clean["breakout_code"].astype(str).str.strip().str.upper()
+        clean["breakout_name"] = clean["breakout_name"].fillna("").astype(str).str.strip()
+        clean = clean[clean["breakout_code"] != ""]
+        if clean["breakout_code"].duplicated().any():
+            st.error("Breakout codes must be unique.")
+        else:
+            with engine.begin() as conn:
+                conn.execute(text("DELETE FROM workshop_breakouts"))
+                for _, row in clean.iterrows():
+                    conn.execute(text("INSERT INTO workshop_breakouts (breakout_code, breakout_name) VALUES (:code, :name)"), {"code": row["breakout_code"], "name": row["breakout_name"]})
+            st.success("Breakout groups updated.")
+            st.rerun()
+
+    st.markdown("### Participant links")
+    deployed_url = st.text_input("Deployed Streamlit URL", placeholder="https://your-app.streamlit.app").strip().rstrip("/")
+    if deployed_url:
+        for _, row in load_breakouts().iterrows():
+            st.code(f"{deployed_url}/?group={row['breakout_code']}", language=None)
+
 def facilitator_view():
     st.subheader("3 · Facilitator dashboard")
-    if not check_pin():
+    if not check_facilitator_pin():
         return
 
     participants = load_participants()
@@ -593,15 +734,17 @@ header()
 
 mode = st.sidebar.radio(
     "Mode",
-    ["Participant", "Breakout lead", "Facilitator"],
+    ["Participant", "Breakout lead", "Facilitator", "Workshop configuration"],
 )
 st.sidebar.markdown("---")
 st.sidebar.caption("WBCSD · CDR implementation workshop")
-st.sidebar.caption("SQLite for local MVP; configure DATABASE_URL for persistent Postgres/Supabase.")
+st.sidebar.caption("Participants need no PIN. Breakout leads and facilitators use separate secrets.")
 
 if mode == "Participant":
     participant_view()
 elif mode == "Breakout lead":
     breakout_lead_view()
-else:
+elif mode == "Facilitator":
     facilitator_view()
+else:
+    workshop_configuration_view()

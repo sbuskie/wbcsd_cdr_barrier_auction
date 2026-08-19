@@ -90,7 +90,7 @@ st.markdown(
     .locked-box {{background:{COLORS['sand']}; padding:.9rem 1rem; border-radius:10px;}}
     .allocation-row {{padding:.35rem 0 .05rem;}}
     .allocation-label {{font-weight:600; margin-bottom:.1rem;}}
-    .required-field-label {{font-size:.875rem; font-weight:400; margin-bottom:-.65rem;}}
+    .required-field-label {{font-size:.875rem; font-weight:400; line-height:1.25rem; margin:0 0 .35rem 0;}}
     .required-asterisk {{color:#D71920; font-weight:700;}}
     .alloc-track {{height:8px;background:{COLORS['pearl']};border-radius:999px;overflow:hidden;margin-top:.2rem;}}
     .alloc-fill {{height:100%;background:{COLORS['orange']};border-radius:999px;}}
@@ -1734,7 +1734,7 @@ def participant_view():
         disabled=True,
         key=f"participant_active_workshop_{wid}",
     )
-    st.caption("The facilitator controls the active workshop. Participant submissions can only be written to this workshop. (* - mandatory input)")
+    st.caption("The facilitator controls the active workshop. Participant submissions can only be written to this workshop.")
 
     preset_breakout = st.query_params.get("group", "").upper()
     breakouts = load_breakouts_cached(wid)
@@ -2771,8 +2771,8 @@ default_idx = 1 if lead_mode else 0
 
 mode = st.sidebar.radio("View", nav_options, index=default_idx)
 st.sidebar.markdown("---")
-st.sidebar.caption("WBCSD · CDR Decision Lab · Version 1.1.5")
-st.sidebar.caption("Participant and Results view require no PIN. Breakout lead and facilitator/admin areas use separate PINs.")
+st.sidebar.caption("WBCSD · CDR Decision Lab · Version 1.1.6")
+st.sidebar.caption("Participant and Results are visible. Breakout lead and facilitator/admin areas use separate PINs.")
 
 if mode == "Participant":
     participant_view()

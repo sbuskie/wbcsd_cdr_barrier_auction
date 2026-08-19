@@ -1734,7 +1734,7 @@ def participant_view():
         disabled=True,
         key=f"participant_active_workshop_{wid}",
     )
-    st.caption("The facilitator controls the active workshop. Participant submissions can only be written to this workshop.")
+    st.caption("The facilitator controls the active workshop. Participant submissions can only be written to this workshop. (* - mandatory input)")
 
     preset_breakout = st.query_params.get("group", "").upper()
     breakouts = load_breakouts_cached(wid)

@@ -2689,9 +2689,13 @@ def workshop_configuration_view():
         "This clears participant submissions, breakout decisions and qualitative responses, "
         "but keeps the workshop configuration and breakout groups."
     )
+    reset_key = f"reset_confirm_{wid}"
+    if st.session_state.pop(f"clear_reset_confirm_next_{wid}", False):
+        st.session_state[reset_key] = ""
+
     reset_confirmation = st.text_input(
         "Type RESET to clear responses",
-        key=f"reset_confirm_{wid}",
+        key=reset_key,
         placeholder="RESET",
     )
     if st.button(
@@ -2701,11 +2705,11 @@ def workshop_configuration_view():
         key=f"reset_button_{wid}",
     ):
         reset_workshop_responses(wid)
-        st.session_state[f"reset_confirm_{wid}"] = ""
         st.session_state.pop(f"fac_snapshot_{wid}", None)
         st.session_state.pop(f"fac_state_{wid}", None)
         st.session_state.pop(f"public_results_snapshot_{wid}", None)
         st.session_state.pop(f"public_results_token_{wid}", None)
+        st.session_state[f"clear_reset_confirm_next_{wid}"] = True
         st.success("Responses cleared; workshop configuration retained.")
         st.rerun()
 
@@ -2718,9 +2722,13 @@ def workshop_configuration_view():
         "This permanently removes the workshop configuration, breakout groups, participant "
         "submissions, breakout decisions and results. This cannot be undone."
     )
+    delete_key = f"delete_confirm_{wid}"
+    if st.session_state.pop(f"clear_delete_confirm_next_{wid}", False):
+        st.session_state[delete_key] = ""
+
     delete_confirmation = st.text_input(
         "Type DELETE to permanently remove this workshop",
-        key=f"delete_confirm_{wid}",
+        key=delete_key,
         placeholder="DELETE",
     )
     if st.button(
@@ -2730,6 +2738,7 @@ def workshop_configuration_view():
         key=f"delete_workshop_{wid}",
     ):
         was_active = bool(row["is_active"])
+        st.session_state[f"clear_delete_confirm_next_{wid}"] = True
         delete_workshop(wid)
         if was_active:
             # Deliberately leave no active workshop rather than silently choosing another.
@@ -2771,7 +2780,7 @@ default_idx = 1 if lead_mode else 0
 
 mode = st.sidebar.radio("View", nav_options, index=default_idx)
 st.sidebar.markdown("---")
-st.sidebar.caption("WBCSD · CDR Decision Lab · Version 1.1.6")
+st.sidebar.caption("WBCSD · CDR Decision Lab · Version 1.1.7")
 st.sidebar.caption("Participant and Results are visible. Breakout lead and facilitator/admin areas use separate PINs.")
 
 if mode == "Participant":

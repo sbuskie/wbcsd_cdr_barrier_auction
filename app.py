@@ -90,6 +90,8 @@ st.markdown(
     .locked-box {{background:{COLORS['sand']}; padding:.9rem 1rem; border-radius:10px;}}
     .allocation-row {{padding:.35rem 0 .05rem;}}
     .allocation-label {{font-weight:600; margin-bottom:.1rem;}}
+    .required-field-label {{font-size:.875rem; font-weight:400; margin-bottom:-.65rem;}}
+    .required-asterisk {{color:#D71920; font-weight:700;}}
     .alloc-track {{height:8px;background:{COLORS['pearl']};border-radius:999px;overflow:hidden;margin-top:.2rem;}}
     .alloc-fill {{height:100%;background:{COLORS['orange']};border-radius:999px;}}
     .total-pill {{display:inline-block;padding:.28rem .75rem;border-radius:999px;background:{COLORS['sage']};font-weight:700;}}
@@ -1581,10 +1583,18 @@ def participant_input_fragment(wid, breakouts, default_breakout_index):
         a, b, c = st.columns(3)
         with a:
             participant_name = st.text_input("Name (optional)", key=f"p_name_{wid}")
-            company = st.text_input("Company", key=f"p_company_{wid}")
+            st.markdown(
+                '<div class="required-field-label">Company <span class="required-asterisk">*</span></div>',
+                unsafe_allow_html=True,
+            )
+            company = st.text_input("Company", key=f"p_company_{wid}", label_visibility="collapsed")
         with b:
             function_name = st.selectbox("Function", FUNCTIONS, key=f"p_function_{wid}")
-            sector = st.text_input("Sector", key=f"p_sector_{wid}")
+            st.markdown(
+                '<div class="required-field-label">Sector <span class="required-asterisk">*</span></div>',
+                unsafe_allow_html=True,
+            )
+            sector = st.text_input("Sector", key=f"p_sector_{wid}", label_visibility="collapsed")
         with c:
             cdr_maturity = st.selectbox("CDR maturity", MATURITY, key=f"p_maturity_{wid}")
             breakout_code = st.selectbox(
@@ -2761,8 +2771,8 @@ default_idx = 1 if lead_mode else 0
 
 mode = st.sidebar.radio("View", nav_options, index=default_idx)
 st.sidebar.markdown("---")
-st.sidebar.caption("WBCSD · CDR Decision Lab · Version 1.1.4")
-st.sidebar.caption("Participant and Results are public. Breakout lead and facilitator/admin areas use separate PINs.")
+st.sidebar.caption("WBCSD · CDR Decision Lab · Version 1.1.5")
+st.sidebar.caption("Participant and Results are visible. Breakout lead and facilitator/admin areas use separate PINs.")
 
 if mode == "Participant":
     participant_view()

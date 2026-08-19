@@ -2772,7 +2772,7 @@ default_idx = 1 if lead_mode else 0
 mode = st.sidebar.radio("View", nav_options, index=default_idx)
 st.sidebar.markdown("---")
 st.sidebar.caption("WBCSD · CDR Decision Lab · Version 1.1.5")
-st.sidebar.caption("Participant and Results are visible. Breakout lead and facilitator/admin areas use separate PINs.")
+st.sidebar.caption("Participant and Results view require no PIN. Breakout lead and facilitator/admin areas use separate PINs.")
 
 if mode == "Participant":
     participant_view()

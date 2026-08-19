@@ -2332,15 +2332,12 @@ def facilitator_view():
         )
 
 
-@st.fragment(run_every="5s")
+@st.fragment
 def public_results_fragment():
     """
-    Public results always follows the facilitator-designated active workshop.
-    Every five seconds it checks only:
-      1. which workshop is active
-      2. that workshop's lightweight state timestamp
-    Full result tables reload only when the active workshop changes or the
-    facilitator presses Refresh results for the active workshop.
+    Public results follows the facilitator-designated active workshop without
+    automatic polling. The displayed snapshot changes only after the facilitator
+    presses Refresh results and the Results view is subsequently loaded/rerun.
     """
     active = active_workshop_direct()
     if not active:
@@ -2380,7 +2377,7 @@ def public_results_fragment():
 
     snapshot = st.session_state[snapshot_key]
     st.caption(
-        "This public view follows the active workshop configured by the facilitator. "
+        "This view shows the latest results published by the facilitator. "
         f"Published results snapshot: {snapshot.get('published_at') or 'Not yet refreshed'}"
     )
 
@@ -2780,7 +2777,7 @@ default_idx = 1 if lead_mode else 0
 
 mode = st.sidebar.radio("View", nav_options, index=default_idx)
 st.sidebar.markdown("---")
-st.sidebar.caption("WBCSD · CDR Decision Lab · Version 1.1.7")
+st.sidebar.caption("WBCSD · CDR Decision Lab · Version 1.1.8")
 st.sidebar.caption("Participant and Results are visible. Breakout lead and facilitator/admin areas use separate PINs.")
 
 if mode == "Participant":
